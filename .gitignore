@@ -1,3 +1,7 @@
 node_modules/
 auth_info_baileys/
+invoices/*.pdf
+invoices/*.html
 .env
+*.log
+push_to_github.bat

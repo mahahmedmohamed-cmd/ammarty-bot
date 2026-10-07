@@ -13,7 +13,8 @@
     "@supabase/supabase-js": "^2.49.1",
     "@whiskeysockets/baileys": "^6.7.19",
     "express": "^4.21.2",
+    "pino": "^9.6.0",
     "qrcode": "^1.5.4",
-    "pino": "^9.6.0"
+    "tesseract.js": "^7.0.0"
   }
 }
