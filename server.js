@@ -658,24 +658,22 @@ async function initWhatsApp() {
             const aiReply = await getAIResponse(senderPhone, text);
             if (aiReply) {
               const replyText = typeof aiReply === 'object' ? aiReply.text : aiReply;
-              const replyImage = typeof aiReply === 'object' ? aiReply.imagePath : null;
+              const hasImage = typeof aiReply === 'object' && aiReply.sendImage;
+              let imgBuffer = typeof aiReply === 'object' ? aiReply.imageBuffer : null;
 
-              if (replyImage && fs.existsSync(replyImage)) {
-                logEvent('إرفاق لقطة شاشة توضيحية للعميل', { to: senderPhone, image: path.basename(replyImage) }, 'info');
-                if (replyText && replyText.length <= 950) {
-                  await sock.sendMessage(senderJid, {
-                    image: fs.readFileSync(replyImage),
-                    caption: replyText
-                  });
-                } else {
-                  if (replyText) {
-                    await sock.sendMessage(senderJid, { text: replyText });
-                  }
-                  await sock.sendMessage(senderJid, {
-                    image: fs.readFileSync(replyImage),
-                    caption: '📱 لقطة شاشة توضيحية من داخل التطبيق للخطوات المذكورة'
-                  });
-                }
+              if (!imgBuffer && typeof aiReply === 'object' && aiReply.imagePath && fs.existsSync(aiReply.imagePath)) {
+                try {
+                  imgBuffer = fs.readFileSync(aiReply.imagePath);
+                } catch (_) {}
+              }
+
+              if (hasImage && imgBuffer) {
+                const imgName = aiReply.filename || (aiReply.imagePath ? path.basename(aiReply.imagePath) : 'screenshot.png');
+                logEvent('إرسال لقطة شاشة توضيحية للعميل', { to: senderPhone, image: imgName }, 'info');
+                await sock.sendMessage(senderJid, {
+                  image: imgBuffer,
+                  caption: replyText || '📱 لقطة شاشة توضيحية من داخل التطبيق'
+                });
               } else if (replyText) {
                 await sock.sendMessage(senderJid, { text: replyText });
               }
@@ -683,7 +681,7 @@ async function initWhatsApp() {
               logEvent('تم الرد عبر المساعد الذكي', {
                 to: senderPhone,
                 preview: (replyText || '').slice(0, 60),
-                hasImage: !!replyImage
+                hasImage: hasImage && !!imgBuffer
               }, 'success');
             }
           } catch (aiErr) {
