@@ -49,10 +49,37 @@ function logEvent(title, detail, type = 'info') {
 }
 
 // ==================== إرسال عرض هدية تقييم المتجر بعد التفعيل ====================
-async function sendPostActivationReviewOffer(targetJid, managerName, buildingName) {
+const sentReviewOffers = new Map(); // targetJid -> timestamp
+
+async function sendPostActivationReviewOffer(targetJid, managerName, buildingName, buildingId = null) {
+  if (!targetJid) return;
+
+  // فحص عدم التكرار للعميل الواحد خلال 24 ساعة
+  const lastSent = sentReviewOffers.get(targetJid);
+  if (lastSent && (Date.now() - lastSent) < 24 * 60 * 60 * 1000) {
+    return;
+  }
+  sentReviewOffers.set(targetJid, Date.now());
+
   setTimeout(async () => {
     try {
       if (!sock || !isConnected || !targetJid) return;
+
+      // إذا كانت العمارة قد حصلت بالفعل على هدية التقييم، لا نطلب التقييم مرة أخرى
+      if (buildingId) {
+        const { data: revGift } = await supabase
+          .from('building_settings')
+          .select('value')
+          .eq('building_id', buildingId)
+          .eq('key', 'review_gift_claimed')
+          .maybeSingle();
+
+        if (revGift && revGift.value) {
+          logEvent('تخطي عرض التقييم', `العمارة (${buildingName || buildingId}) حصلت على هدية التقييم مسبقاً`, 'info');
+          return;
+        }
+      }
+
       const reviewMsg =
         `🎁 *هدية خاصة لعمارتكم من أسرة "عمارتي"!* 🌟\n\n` +
         `أستاذ *${managerName || 'المدير'}*، رأيكم وتقييمكم يهمنا جداً ويسعدنا دائماً! ⭐⭐⭐⭐⭐\n\n` +
@@ -67,7 +94,7 @@ async function sendPostActivationReviewOffer(targetJid, managerName, buildingNam
     } catch (err) {
       logEvent('خطأ إرسال عرض تقييم المتجر', err.message, 'warning');
     }
-  }, 2500);
+  }, 3500);
 }
 
 // ==================== تحليل رسائل الواتساب الواردة ====================
@@ -143,12 +170,24 @@ async function initWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    const processedMsgIds = new Set();
+
     // استقبال ومعالجة رسائل واتساب (اللحظية notify، أو المتأخرة أثناء انقطاع البوت append)
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return;
 
       for (const msg of messages) {
         if (!msg.message || msg.key.fromMe || msg.key.remoteJid.includes('@g.us')) continue;
+
+        // منع تكرار معالجة الرسائل ذات نفس المعرف (ID deduplication)
+        if (msg.key?.id) {
+          if (processedMsgIds.has(msg.key.id)) continue;
+          processedMsgIds.add(msg.key.id);
+          if (processedMsgIds.size > 2000) {
+            const oldest = processedMsgIds.values().next().value;
+            processedMsgIds.delete(oldest);
+          }
+        }
 
         // تجاهل الرسائل القديمة جداً (أكثر من 12 ساعة) لتجنب تكرار الرد على محادثات الأيام السابقة عند المزامنة
         const rawTs = msg.messageTimestamp;
@@ -537,7 +576,7 @@ async function initWhatsApp() {
                 }
 
                 // إرسال عرض هدية تقييم المتجر (شهرين مجاناً) بعد التفعيل
-                sendPostActivationReviewOffer(senderJid, building.manager_name, building.name);
+                sendPostActivationReviewOffer(senderJid, building.manager_name, building.name, building.id);
 
                 // إذا كان هناك عملاء آخرين متزامنين في نفس الدفعة، نرسل لهم إشعار توضيحي
                 if (match.matchedAmbiguous && Array.isArray(match.matchedAmbiguous.candidates)) {
@@ -699,113 +738,168 @@ async function initWhatsApp() {
 initWhatsApp();
 
 // ==================== مراقب صندوق الإرسال الآلي (Outbox Poller) ====================
-// يفحص سوبابايز كل 3 ثوانٍ؛ إذا قام السيرفر السحابي بتفعيل أي اشتراك يرسل الفاتورة للعميل فوراً
+// محرك متزامن محكم يمنع التكرار نهائياً (Sequential Loop + In-Memory Lock + Immediate DB Lock)
 
-setInterval(async () => {
-  if (!isConnected || !sock) return;
+let isOutboxPolling = false;
+const activeOutboxBuildingIds = new Set();
 
+async function pollOutbox() {
+  if (isOutboxPolling) return;
+  if (!isConnected || !sock) {
+    setTimeout(pollOutbox, 4000);
+    return;
+  }
+
+  isOutboxPolling = true;
   try {
     const { data: outboxRows, error } = await supabase
       .from('building_settings')
       .select('building_id, value')
       .eq('key', 'whatsapp_outbox');
 
-    if (error || !outboxRows || outboxRows.length === 0) return;
-
-    for (const row of outboxRows) {
-      if (!row.value) continue;
-      let order = null;
-      try {
-        order = JSON.parse(row.value);
-      } catch (_) {
-        continue;
-      }
-
-      if (order && order.status === 'queued') {
-        const targetJid = order.target_jid || (order.target_phone ? `${order.target_phone.replace(/^0/, '20')}@s.whatsapp.net` : null);
-        if (!targetJid) continue;
-
-        logEvent('معالجة رسالة من صندوق الإرسال', `عمارة: ${order.building_code || 'إشعار'} إلى: ${targetJid}`);
-
-        let waMsg;
-        if (order.is_plain_text && order.message_text) {
-          waMsg = order.message_text;
-        } else {
-          const yearsText = order.years_count === 1 ? 'سنة كاملة' : `${order.years_count} سنوات كاملة`;
-          waMsg =
-            `🎉 *ألف مبروك! تم تفعيل ترخيص عمارتكم بنجاح* 🏢✨\n\n` +
-            `أستاذ *${order.manager_name || 'المدير'}*، تم بنجاح استلام مبلغ *${order.amount} ج.م* عبر ${order.payment_method} (رقم العملية: *${order.transaction_id}*).\n\n` +
-            `✅ *تفاصيل الترخيص المعتمد:*\n` +
-            `• العمارة: *${order.building_name}* (كود: *${order.building_code}*)\n` +
-            `• مدة الاشتراك: *${yearsText}*\n` +
-            `• تاريخ الصلاحية حتى: *${order.expiry_date}*\n` +
-            `• رقم الفاتورة الرسمية: *${order.invoice_no}*\n\n` +
-            `نظام عمارتكم الآن نشط ومتاح بالكامل لجميع السكان ومجلس الإدارة.\n` +
-            `مرفق لكم بالأسفل الفاتورة الرسمية المعتمدة بصيغة PDF 📄👇\n` +
-            `شكراً لثقتكم الغالية في تطبيق عمارتي 🚀`;
+    if (!error && outboxRows && outboxRows.length > 0) {
+      for (const row of outboxRows) {
+        if (!row.value) continue;
+        let order = null;
+        try {
+          order = JSON.parse(row.value);
+        } catch (_) {
+          continue;
         }
 
-        try {
-          await sock.sendMessage(targetJid, { text: waMsg });
-          logEvent('تم إرسال رسالة من صندوق الإرسال', { to: targetJid }, 'success');
+        // معالجة فقط الطلبات التي في حالة queued ولم يتم قفلها في الذاكرة
+        if (order && order.status === 'queued') {
+          if (activeOutboxBuildingIds.has(row.building_id)) continue;
+          activeOutboxBuildingIds.add(row.building_id);
 
-          // إذا كانت رسالة فاتورة رسمية، نولد ونرفق ملف الـ PDF
-          if (!order.is_plain_text && order.invoice_no && order.building_code) {
-            try {
-              const bld = {
-                code: order.building_code,
-                name: order.building_name,
-                manager_name: order.manager_name,
-                manager_phone: order.target_phone,
-                apartments_count: order.apartments_count || 0
-              };
-              const pdfPath = await generateInvoicePDF({
-                invoiceNo: order.invoice_no,
-                building: bld,
-                yearsCount: order.years_count || 1,
-                paidPrice: order.amount || 200,
-                paymentMethod: order.payment_method || 'InstaPay',
-                txnRef: order.transaction_id,
-                expiryDate: order.expiry_date ? new Date(order.expiry_date.split('/').reverse().join('-')) : null
+          try {
+            // خطوة حرجة 1: قفل الطلب فوراً في قاعدة البيانات لمنع أي تكرار
+            order.status = 'processing';
+            order.processing_at = new Date().toISOString();
+            await supabase
+              .from('building_settings')
+              .upsert({
+                building_id: row.building_id,
+                key: 'whatsapp_outbox',
+                value: JSON.stringify(order),
+                updated_at: new Date().toISOString()
               });
-              if (pdfPath && fs.existsSync(pdfPath)) {
-                await sock.sendMessage(targetJid, {
-                  document: fs.readFileSync(pdfPath),
-                  mimetype: 'application/pdf',
-                  fileName: `فاتورة_اشتراك_${order.building_code}.pdf`,
-                  caption: `فاتورة ترخيص رسمية معتمدة - ${order.building_name} (${order.building_code}) 🏢`
+
+            const targetJid = order.target_jid || (order.target_phone ? `${order.target_phone.replace(/^0/, '20')}@s.whatsapp.net` : null);
+            if (!targetJid) {
+              order.status = 'failed';
+              order.error = 'No valid target JID or phone';
+              await supabase
+                .from('building_settings')
+                .upsert({
+                  building_id: row.building_id,
+                  key: 'whatsapp_outbox',
+                  value: JSON.stringify(order),
+                  updated_at: new Date().toISOString()
                 });
-                logEvent('تم إرفاق وتسليم ملف PDF الفاتورة عبر صندوق الإرسال', order.building_code, 'success');
-              }
-
-              // إرسال عرض هدية تقييم المتجر (شهرين مجاناً) بعد التفعيل
-              sendPostActivationReviewOffer(targetJid, order.manager_name, order.building_name);
-            } catch (pErr) {
-              logEvent('تنبيه PDF بصندوق الإرسال', pErr.message, 'warning');
+              continue;
             }
+
+            logEvent('معالجة رسالة من صندوق الإرسال', `عمارة: ${order.building_code || 'إشعار'} إلى: ${targetJid}`);
+
+            let waMsg;
+            if (order.is_plain_text && order.message_text) {
+              waMsg = order.message_text;
+            } else {
+              const yearsText = order.years_count === 1 ? 'سنة كاملة' : `${order.years_count} سنوات كاملة`;
+              waMsg =
+                `🎉 *ألف مبروك! تم تفعيل ترخيص عمارتكم بنجاح* 🏢✨\n\n` +
+                `أستاذ *${order.manager_name || 'المدير'}*، تم بنجاح استلام مبلغ *${order.amount} ج.م* عبر ${order.payment_method} (رقم العملية: *${order.transaction_id || 'سداد معتمد'}*).\n\n` +
+                `✅ *تفاصيل الترخيص المعتمد:*\n` +
+                `• العمارة: *${order.building_name}* (كود: *${order.building_code}*)\n` +
+                `• مدة الاشتراك: *${yearsText}*\n` +
+                `• تاريخ الصلاحية حتى: *${order.expiry_date}*\n` +
+                `• رقم الفاتورة الرسمية: *${order.invoice_no}*\n\n` +
+                `نظام عمارتكم الآن نشط ومتاح بالكامل لجميع السكان ومجلس الإدارة.\n` +
+                `مرفق لكم بالأسفل الفاتورة الرسمية المعتمدة بصيغة PDF 📄👇\n` +
+                `شكراً لثقتكم الغالية في تطبيق عمارتي 🚀`;
+            }
+
+            // إرسال النص
+            await sock.sendMessage(targetJid, { text: waMsg });
+            logEvent('تم إرسال رسالة من صندوق الإرسال', { to: targetJid }, 'success');
+
+            // إذا كانت رسالة تفعيل رسمية ولها فاتورة
+            if (!order.is_plain_text && order.invoice_no && order.building_code) {
+              try {
+                const bld = {
+                  code: order.building_code,
+                  name: order.building_name,
+                  manager_name: order.manager_name,
+                  manager_phone: order.target_phone,
+                  apartments_count: order.apartments_count || 0
+                };
+                const pdfPath = await generateInvoicePDF({
+                  invoiceNo: order.invoice_no,
+                  building: bld,
+                  yearsCount: order.years_count || 1,
+                  paidPrice: order.amount || 200,
+                  paymentMethod: order.payment_method || 'InstaPay',
+                  txnRef: order.transaction_id,
+                  expiryDate: order.expiry_date ? new Date(order.expiry_date.split('/').reverse().join('-')) : null
+                });
+                if (pdfPath && fs.existsSync(pdfPath)) {
+                  await sock.sendMessage(targetJid, {
+                    document: fs.readFileSync(pdfPath),
+                    mimetype: 'application/pdf',
+                    fileName: `فاتورة_اشتراك_${order.building_code}.pdf`,
+                    caption: `فاتورة ترخيص رسمية معتمدة - ${order.building_name} (${order.building_code}) 🏢`
+                  });
+                  logEvent('تم إرفاق وتسليم ملف PDF الفاتورة عبر صندوق الإرسال', order.building_code, 'success');
+                }
+
+                // إرسال عرض هدية تقييم المتجر إذا لم تكن العمارة قد حصلت عليها بالفعل
+                sendPostActivationReviewOffer(targetJid, order.manager_name, order.building_name, row.building_id);
+              } catch (pErr) {
+                logEvent('تنبيه PDF بصندوق الإرسال', pErr.message, 'warning');
+              }
+            }
+
+            // تحديث الحالة النهائية إلى sent
+            order.status = 'sent';
+            order.sent_at = new Date().toISOString();
+            await supabase
+              .from('building_settings')
+              .upsert({
+                building_id: row.building_id,
+                key: 'whatsapp_outbox',
+                value: JSON.stringify(order),
+                updated_at: new Date().toISOString()
+              });
+
+          } catch (sendErr) {
+            logEvent('خطأ أثناء إرسال رسالة واتساب من الصندوق', sendErr.message, 'error');
+            order.status = 'failed';
+            order.error = sendErr.message;
+            await supabase
+              .from('building_settings')
+              .upsert({
+                building_id: row.building_id,
+                key: 'whatsapp_outbox',
+                value: JSON.stringify(order),
+                updated_at: new Date().toISOString()
+              });
+          } finally {
+            activeOutboxBuildingIds.delete(row.building_id);
           }
-
-          // تحديث الحالة إلى sent حتى لا تتكرر
-          order.status = 'sent';
-          order.sent_at = new Date().toISOString();
-          await supabase
-            .from('building_settings')
-            .upsert({
-              building_id: row.building_id,
-              key: 'whatsapp_outbox',
-              value: JSON.stringify(order),
-              updated_at: new Date().toISOString()
-            });
-
-        } catch (sendErr) {
-          logEvent('خطأ أثناء إرسال رسالة واتساب', sendErr.message, 'error');
         }
       }
     }
   } catch (err) {
     // تجاهل أخطاء الاتصال الدورية
+  } finally {
+    isOutboxPolling = false;
+    setTimeout(pollOutbox, 4000);
   }
-}, 3500);
+}
+
+// بدء المراقب المتسلسل الآمن
+setTimeout(pollOutbox, 4000);
 
 // ==================== محرك تحليل وتفعيل الدفع التلقائي ====================
 
@@ -1176,7 +1270,7 @@ async function processPayment(parsed) {
         }
 
         // إرسال عرض هدية تقييم المتجر (شهرين مجاناً) بعد التفعيل
-        sendPostActivationReviewOffer(targetJid, matchedBuilding.manager_name, matchedBuilding.name);
+        sendPostActivationReviewOffer(targetJid, matchedBuilding.manager_name, matchedBuilding.name, matchedBuilding.id);
       } catch (pErr) {
         logEvent('تنبيه PDF في التفعيل الفوري', pErr.message, 'warning');
       }
