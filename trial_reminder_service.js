@@ -112,7 +112,7 @@ function buildInitialReminderMessage({ managerName, buildingName, daysLeft }) {
   const daysText = daysLeft === 1 ? 'يوم واحد فقط' : (daysLeft === 2 ? 'يومين اثنين' : `${daysLeft} أيام`);
 
   return (
-    `أستاذ *${managerName || 'مسؤول العمارة'}* العزيز، تحياتنا لك من إدارة تطبيق عمارتي 🏢✨\n\n` +
+    `مرحباً *${managerName || 'مسؤول العمارة'}*، تحياتنا لك من إدارة تطبيق عمارتي 🏢✨\n\n` +
     `نتمنى أن تكون تجربتكم لتطبيق عمارتي خلال الفترة الماضية قد ساعدتكم في تنظيم حسابات ومصروفات (*${buildingName}*) وإنهاء مشكلات التحصيل بكل راحة وشفافية.\n\n` +
     `📅 نود إحاطة سيادتكم بأن الفترة التجريبية المجانية لعمارتكم ستنتهي بعد **${daysText}**.\n\n` +
     `هل تحب نوضح لسيادتكم باقات الاشتراك السنوية المخفضة وطريقة التفعيل للاستمرار معكم؟ 🌸\n\n` +
@@ -127,7 +127,7 @@ function buildInitialReminderMessage({ managerName, buildingName, daysLeft }) {
  */
 function buildPricingDetailsMessage({ managerName, buildingName }) {
   return (
-    `أهلاً بك أستاذ *${managerName || 'المدير'}* 🏢✨\n` +
+    `مرحباً بك *${managerName || 'مسؤول العمارة'}* 🏢✨\n` +
     `يسعدنا ويشرفنا جداً استمراركم معنا في أسرة تطبيق عمارتي لخدمة عمارة (*${buildingName}*)!\n\n` +
     `📋 *باقات الاشتراك الرسمية المعتمدة لعمارتكم:*\n` +
     `• *سنة واحدة:* 200 ج.م فقط\n` +
@@ -149,7 +149,7 @@ function buildPricingDetailsMessage({ managerName, buildingName }) {
  */
 function buildDeclineMessage({ managerName, buildingName }) {
   return (
-    `تحت أمرك أستاذ *${managerName || 'المدير'}* في أي وقت! 🌸\n\n` +
+    `تحت أمرك *${managerName || 'مسؤول العمارة'}* في أي وقت! 🌸\n\n` +
     `نتمنى لسيادتكم ولسكان (*${buildingName}*) دوام التوفيق والراحة.\n` +
     `إذا احتجت أي مساعدة أو قررت التجديد لاحقاً، نحن دائماً في خدمتك ويسعدنا تواصلك معنا في أي وقت. دمتم بكل خير ✨`
   );
