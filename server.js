@@ -33,6 +33,9 @@ let currentQR = null;
 let isConnected = false;
 let sock = null;
 const liveTransactions = [];
+const lidToPhoneMap = new Map();
+lidToPhoneMap.set('150963839045834@lid', '01021252626');
+lidToPhoneMap.set('24953911021748@lid', '01012999823');
 
 // مجلد حفظ جلسة واتساب
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
@@ -299,7 +302,10 @@ async function initWhatsApp() {
 
         const senderJid = msg.key.remoteJid;
         const cleanSenderPhone = senderJid.split('@')[0].split(':')[0].replace(/\D/g, '');
-        const senderPhone = cleanSenderPhone;
+        let senderPhone = cleanSenderPhone;
+        if (senderJid.endsWith('@lid') && lidToPhoneMap.has(senderJid)) {
+          senderPhone = lidToPhoneMap.get(senderJid);
+        }
         const text =
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
@@ -2008,6 +2014,128 @@ app.post('/api/trial-reminders/send-live', async (req, res) => {
       limit
     });
     res.json({ ok: true, message: `تم إرسال التنبيهات لـ ${result.sentCount} عمارة بنجاح`, result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// نقطة إرسال باقات الاشتراك وعرض الهدية فورياً لعمارة معينة (مثل عمارة حسني أو عمارة طلباتي)
+app.post('/api/trial-reminders/send-pricing-now', async (req, res) => {
+  try {
+    if (!sock || !isConnected) {
+      return res.status(400).json({ ok: false, error: 'واتساب غير متصل حالياً' });
+    }
+    const { buildingId, buildingCode, phone } = req.body || {};
+
+    let query = supabase.from('buildings').select('id, name, code, manager_name, manager_phone');
+    if (buildingId) query = query.eq('id', buildingId);
+    else if (buildingCode) query = query.eq('code', buildingCode);
+    else if (phone) query = query.eq('manager_phone', phone);
+    else return res.status(400).json({ ok: false, error: 'يرجى تحديد buildingId أو buildingCode أو phone' });
+
+    const { data: blds, error } = await query;
+    if (error || !blds || blds.length === 0) {
+      return res.status(404).json({ ok: false, error: 'لم يتم العثور على العمارة' });
+    }
+
+    const bld = blds[0];
+    const { buildPricingDetailsMessage } = require('./trial_reminder_service');
+    const msgText = buildPricingDetailsMessage({
+      managerName: bld.manager_name,
+      buildingName: bld.name
+    });
+
+    const phoneClean = bld.manager_phone.replace(/\D/g, '');
+    let targetJid = `${phoneClean.startsWith('0') ? '2' + phoneClean : phoneClean}@s.whatsapp.net`;
+    let recipientLid = null;
+
+    if (sock?.onWhatsApp) {
+      try {
+        const [waUser] = (await sock.onWhatsApp(targetJid)) || [];
+        if (waUser?.lid) {
+          recipientLid = waUser.lid;
+          lidToPhoneMap.set(waUser.lid, bld.manager_phone);
+        }
+      } catch (_) {}
+    }
+
+    // إرسال كشف الباقات للمدير
+    await sock.sendMessage(targetJid, { text: msgText });
+
+    // توثيق الحالة كـ accepted في سوبابايز
+    await supabase.from('building_settings').upsert({
+      building_id: bld.id,
+      key: 'trial_offer_pending_reply',
+      value: JSON.stringify({
+        status: 'accepted',
+        manager_name: bld.manager_name,
+        building_name: bld.name,
+        building_code: bld.code,
+        manager_phone: bld.manager_phone,
+        target_jid: targetJid,
+        manager_lid: recipientLid,
+        sent_at: new Date().toISOString(),
+        accepted_at: new Date().toISOString(),
+        note: 'تم إرسال كشف الباقات بنجاح'
+      }),
+      updated_at: new Date().toISOString()
+    });
+
+    logEvent('تم إرسال كشف الباقات والهدية للمدير', {
+      building: bld.name,
+      phone: bld.manager_phone,
+      lid: recipientLid
+    }, 'success');
+
+    // إشعار المهندس محمود
+    try {
+      await sock.sendMessage('201021252626@s.whatsapp.net', {
+        text: `🚀 *تم إرسال باقات الاشتراك والهدية فورياً!* 🏢✨\nالمدير: *${bld.manager_name}* (${bld.manager_phone})\nعمارة: *${bld.name}* (${bld.code})\nتم تسليم كشف الأسعار وطريقة السداد للمدير بنجاح!`
+      });
+    } catch (_) {}
+
+    res.json({ ok: true, message: `تم إرسال الباقات لـ ${bld.manager_name} (${bld.name}) بنجاح`, building: bld, recipientLid });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// نقطة مزامنة الـ LIDs لجميع العمائر المعلقة لحل المشكلة فورياً
+app.post('/api/trial-reminders/sync-lids', async (req, res) => {
+  try {
+    if (!sock || !isConnected) {
+      return res.status(400).json({ ok: false, error: 'واتساب غير متصل حالياً' });
+    }
+    const { data: rows } = await supabase
+      .from('building_settings')
+      .select('*, buildings(name, code, manager_name, manager_phone)')
+      .eq('key', 'trial_offer_pending_reply');
+
+    const synced = [];
+    if (rows) {
+      for (const row of rows) {
+        try {
+          const val = JSON.parse(row.value);
+          if (val.manager_phone && sock?.onWhatsApp) {
+            const clean = val.manager_phone.replace(/\D/g, '');
+            const targetJid = `${clean.startsWith('0') ? '2' + clean : clean}@s.whatsapp.net`;
+            const [waUser] = (await sock.onWhatsApp(targetJid)) || [];
+            if (waUser?.lid) {
+              val.manager_lid = waUser.lid;
+              lidToPhoneMap.set(waUser.lid, val.manager_phone);
+              await supabase.from('building_settings').upsert({
+                building_id: row.building_id,
+                key: 'trial_offer_pending_reply',
+                value: JSON.stringify(val),
+                updated_at: new Date().toISOString()
+              });
+              synced.push({ building_id: row.building_id, phone: val.manager_phone, lid: waUser.lid });
+            }
+          }
+        } catch (_) {}
+      }
+    }
+    res.json({ ok: true, syncedCount: synced.length, synced });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }

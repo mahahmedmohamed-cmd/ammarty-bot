@@ -204,6 +204,17 @@ async function checkAndSendTrialReminders({
 
       if (!targetJid) continue;
 
+      // محاولة معرفة LID الخاص بالمستلم مقدماً لتسريع مطابقة الردود الواردة
+      let managerLid = null;
+      try {
+        if (sock?.onWhatsApp) {
+          const [waUser] = (await sock.onWhatsApp(targetJid)) || [];
+          if (waUser?.lid) {
+            managerLid = waUser.lid;
+          }
+        }
+      } catch (_) {}
+
       // 2. إرسال الرسالة الأولى للمدير
       const textMsg = buildInitialReminderMessage({
         managerName: item.managerName,
@@ -218,7 +229,8 @@ async function checkAndSendTrialReminders({
       logEvent('تم إرسال تنبيه تجربة للمدير', {
         building: item.buildingName,
         phone: targetPhoneOverride || item.managerPhone,
-        daysLeft: item.daysLeft
+        daysLeft: item.daysLeft,
+        lid: managerLid
       }, 'success');
 
       // 3. توثيق الإرسال في سوبابايز وحفظ حالة الانتظار للرد (فقط عند الإرسال الحقيقي للعملاء)
@@ -229,7 +241,9 @@ async function checkAndSendTrialReminders({
           value: JSON.stringify({
             sent_at: new Date().toISOString(),
             days_left: item.daysLeft,
-            phone: item.managerPhone
+            phone: item.managerPhone,
+            target_jid: targetJid,
+            manager_lid: managerLid
           }),
           updated_at: new Date().toISOString()
         });
@@ -243,6 +257,8 @@ async function checkAndSendTrialReminders({
             building_name: item.buildingName,
             building_code: item.buildingCode,
             manager_phone: item.managerPhone,
+            target_jid: targetJid,
+            manager_lid: managerLid,
             sent_at: new Date().toISOString()
           }),
           updated_at: new Date().toISOString()
@@ -284,6 +300,7 @@ async function checkAndSendTrialReminders({
 
 /**
  * فحص هل العميل يرد على سؤال عرض الاشتراك (نعم / لا)
+ * يدعم بدقة أرقام الهواتف ومعرفات واتساب الحديثة (LID)
  */
 async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPhone, text, logEvent }) {
   if (!text) return false;
@@ -291,7 +308,7 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
   const cleanDigits = String(senderPhone || '').replace(/\D/g, '');
   const senderLast9 = cleanDigits.slice(-9);
 
-  // 1. البحث هل هناك عرض معلق لهذا الرقم
+  // 1. البحث في سجلات العروض في سوبابايز
   const { data: rows, error } = await supabase
     .from('building_settings')
     .select('*, buildings(name, code, manager_name, manager_phone)')
@@ -302,12 +319,19 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
   let matchedRow = null;
   let offerData = null;
 
+  // أ) المطابقة المباشرة بالهاتف أو بالـ LID المسجل مسبقاً أو الـ target_jid
   for (const row of rows) {
     try {
       const val = JSON.parse(row.value);
-      if (val.status === 'awaiting_reply') {
+      // التحقق من الحالات المعلقة، أو الحالات المقبولة حديثاً (إذا أعاد العميل السؤال أو طلب الباقات)
+      const isEligibleStatus = val.status === 'awaiting_reply' || (val.status === 'accepted' && val.sent_at && (Date.now() - new Date(val.sent_at).getTime()) < 48 * 3600 * 1000);
+      if (isEligibleStatus) {
         const phone = (val.manager_phone || '').replace(/\D/g, '');
-        if (phone.endsWith(senderLast9) || cleanDigits.endsWith(phone.slice(-9))) {
+        const phoneMatches = phone && cleanDigits && (phone.endsWith(senderLast9) || cleanDigits.endsWith(phone.slice(-9)));
+        const jidMatches = (val.manager_lid && val.manager_lid === senderJid) ||
+                           (val.target_jid && val.target_jid === senderJid);
+
+        if (phoneMatches || jidMatches) {
           matchedRow = row;
           offerData = val;
           break;
@@ -316,22 +340,55 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
     } catch (_) {}
   }
 
+  // ب) إذا لم يتطابق، وكان المرسل يرسل عبر معرف واتساب LID (@lid)، نقوم بالتحقق الديناميكي عبر onWhatsApp
+  if (!matchedRow && senderJid && senderJid.endsWith('@lid') && sock?.onWhatsApp) {
+    for (const row of rows) {
+      try {
+        const val = JSON.parse(row.value);
+        const isEligibleStatus = val.status === 'awaiting_reply' || (val.status === 'accepted' && val.sent_at && (Date.now() - new Date(val.sent_at).getTime()) < 48 * 3600 * 1000);
+        if (isEligibleStatus && val.manager_phone) {
+          const targetJid = formatPhoneToJid(val.manager_phone);
+          if (targetJid) {
+            const [waUser] = (await sock.onWhatsApp(targetJid)) || [];
+            if (waUser?.lid && waUser.lid === senderJid) {
+              matchedRow = row;
+              offerData = val;
+              // حفظ الـ LID في قاعدة البيانات لتسريع الردود المستقبلية
+              val.manager_lid = waUser.lid;
+              await supabase.from('building_settings').upsert({
+                building_id: row.building_id,
+                key: 'trial_offer_pending_reply',
+                value: JSON.stringify(val),
+                updated_at: new Date().toISOString()
+              });
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
   if (!matchedRow || !offerData) return false;
 
   const cleanText = text.trim().toLowerCase();
 
-  // فحص الرد بالإيجاب (1، نعم، اه، ياريت، تمام، عايز اشترك، الاسعار، التفاصيل، وضحلي)
+  // فحص الرد بالإيجاب (1، ١، 1️⃣، نعم، اه، ياريت، تمام، اتفضل، باقات الاشتراك، الاسعار، التفاصيل، وضحلي، ...)
   const isAffirmative =
-    /^(?:1|١|نعم|اه|أه|ايوه|أيوة|ياريت|يا ريت|تمام|أكيد|اكيد|عايز اشترك|اشترك|تفاصيل|التفاصيل|الاسعار|الأسعار|كام|بكام|وضح|ابعتلي|معلومات)$/i.test(cleanText) ||
-    /(?:نعم|ياريت|عايز\s*(?:اشترك|اجدد)|وضحلي|ابعتلي\s*(?:الباقات|التفاصيل))/i.test(cleanText);
+    /^(?:1|١|1️⃣|نعم|اه|أه|ايوه|أيوة|ياريت|يا ريت|تمام|أكيد|اكيد|اتفضل|تفضل|باقات|الباقات|باقات الاشتراك|عايز اشترك|اشترك|تفاصيل|التفاصيل|الاسعار|الأسعار|كام|بكام|وضح|وضحلي|وضح لي|وضح لي الباقات|ابعتلي|ابعت لي|معلومات|اوك|أوك|ماشى|ماشي|وريني|عايز اعرف|مهتم|ارسل|أرسل|ابعت)$/i.test(cleanText) ||
+    /(?:نعم|ياريت|عايز\s*(?:اشترك|اجدد|اعرف)|وضح\s*(?:لي|لنا|الباقات)|ابعت\s*(?:لي|لنا)|اتفضل|تفضل|باقات\s*(?:الاشتراك|الاسعار)|طريقة\s*الاشتراك|تفاصيل\s*(?:الباقات|الاشتراك))/i.test(cleanText);
 
-  // فحص الرد بالرفض (2، لا، شكرا، مش محتاج، مش دلوقتي)
+  // فحص الرد بالرفض (2، ٢، 2️⃣، لا، شكرا، مش محتاج، مش دلوقتي)
   const isNegative =
-    /^(?:2|٢|لا|لأ|مش محتاج|مش دلوقتي|شكرا|شكراً|مش عايز|لا شكرا|لا شكراً)$/i.test(cleanText) ||
+    /^(?:2|٢|2️⃣|لا|لأ|مش محتاج|مش دلوقتي|شكرا|شكراً|مش عايز|لا شكرا|لا شكراً)$/i.test(cleanText) ||
     /(?:لا\s*شكرا|مش\s*محتاج|مش\s*دلوقتي)/i.test(cleanText);
 
   if (isAffirmative) {
-    logEvent('رد إيجابي على عرض الاشتراك التجريبي', { phone: senderPhone, building: offerData.building_name }, 'success');
+    logEvent('رد إيجابي على عرض الاشتراك التجريبي', {
+      phone: offerData.manager_phone,
+      building: offerData.building_name,
+      senderJid
+    }, 'success');
 
     const replyMsg = buildPricingDetailsMessage({
       managerName: offerData.manager_name,
@@ -343,6 +400,7 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
     // تحديث الحالة إلى مقبولة لمنع تكرار الرد
     offerData.status = 'accepted';
     offerData.accepted_at = new Date().toISOString();
+    offerData.reply_jid = senderJid;
     await supabase.from('building_settings').upsert({
       building_id: matchedRow.building_id,
       key: 'trial_offer_pending_reply',
@@ -361,7 +419,11 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
   }
 
   if (isNegative) {
-    logEvent('اعتذار عن عرض الاشتراك التجريبي', { phone: senderPhone, building: offerData.building_name }, 'info');
+    logEvent('اعتذار عن عرض الاشتراك التجريبي', {
+      phone: offerData.manager_phone,
+      building: offerData.building_name,
+      senderJid
+    }, 'info');
 
     const declineMsg = buildDeclineMessage({
       managerName: offerData.manager_name,
@@ -372,6 +434,7 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
 
     offerData.status = 'declined';
     offerData.declined_at = new Date().toISOString();
+    offerData.reply_jid = senderJid;
     await supabase.from('building_settings').upsert({
       building_id: matchedRow.building_id,
       key: 'trial_offer_pending_reply',
