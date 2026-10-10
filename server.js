@@ -15,6 +15,8 @@ const { generateInvoiceHTML } = require('./invoice_template');
 const { extractTextFromImage, parseReceiptData, matchReceiptWithCollision, normalizeDigits } = require('./receipt_scanner');
 const { generateInvoicePDF, formatDate, tafqeetEgyptianPounds } = require('./pdf_generator');
 const { getAIResponse } = require('./customer_service_ai');
+const { isAdminUser, handleAdminMessage } = require('./admin_service');
+const { handleTrialReminderResponse, checkAndSendTrialReminders } = require('./trial_reminder_service');
 
 const app = express();
 app.use(express.json());
@@ -47,6 +49,26 @@ function logEvent(title, detail, type = 'info') {
   if (liveTransactions.length > 50) liveTransactions.pop();
   console.log(`[${item.time}] [${type.toUpperCase()}] ${title}: ${typeof detail === 'object' ? JSON.stringify(detail) : detail}`);
 }
+
+// نظام التعافي التلقائي وحذف الجلسات المشفرة التالفة فور رصدها لمنع تعليق البوت
+const originalConsoleError = console.error;
+console.error = function(...args) {
+  const msg = args.map(a => String(a && a.stack || a)).join(' ');
+  if (msg.includes('Bad MAC') || msg.includes('Over 2000 messages into the future') || msg.includes('Failed to decrypt message')) {
+    const match = msg.match(/(?:async\s+|session-)?(\d+\.\d+|\d{10,})/);
+    if (match) {
+      const sessionId = match[1];
+      const sessionFile = path.join(AUTH_DIR, `session-${sessionId}.json`);
+      if (fs.existsSync(sessionFile)) {
+        try {
+          fs.unlinkSync(sessionFile);
+          logEvent('معالجة ذاتية لجلسة واتساب', `تم حذف الجلسة التالفة (${sessionId}) لإعادة التفاوض النظيف تلقائياً`, 'info');
+        } catch (_) {}
+      }
+    }
+  }
+  originalConsoleError.apply(console, args);
+};
 
 // ==================== إرسال عرض هدية تقييم المتجر بعد التفعيل ====================
 const sentReviewOffers = new Map(); // targetJid -> timestamp
@@ -81,13 +103,14 @@ async function sendPostActivationReviewOffer(targetJid, managerName, buildingNam
       }
 
       const reviewMsg =
-        `🎁 *هدية خاصة لعمارتكم من أسرة "عمارتي"!* 🌟\n\n` +
-        `أستاذ *${managerName || 'المدير'}*، رأيكم وتقييمكم يهمنا جداً ويسعدنا دائماً! ⭐⭐⭐⭐⭐\n\n` +
-        `إذا تكرمت بالدخول على متجر Google Play وكتابة تقييم إيجابي (5 نجوم) للتطبيق، يسعدنا أن نهديك **شهرين إضافيين مجاناً (60 يوماً)** تُضاف تلقائياً لصلاحية اشتراك عمارتكم بعد انتهاء مدة الاشتراك التي تم تفعيلها اليوم! 🥳🏢\n\n` +
+        `🎁 *عرض الهدية الكبرى لعمارتكم من أسرة "عمارتي"!* 🌟🏢\n\n` +
+        `أستاذ *${managerName || 'المدير'}*، رأيكم وتقييمكم أنتم وسكان عمارتكم يسعدنا ويهمنا جداً! ⭐⭐⭐⭐⭐\n\n` +
+        `إذا قام **3 أفراد من عمارتكم** (حضرتك و2 من السكان أو الملاك) بكتابة تقييم إيجابي (5 نجوم) للتطبيق على متجر Google Play، يسعدنا أن نهدي عمارتكم **شهرين إضافيين مجاناً (60 يوماً)** تُضاف كزيادة مباشرة فوق مدة اشتراككم المدفوع (مثال: اشتراك سنة يصبح 14 شهراً بالكامل)! 🥳🎁\n\n` +
+        `📌 *توضيح:* هذه الهدية هي بونص إضافي خاص يُمنح زيادة فوق مدة الاشتراك الرسمي ولا تُمنح كفترة منفصلة بدون اشتراك رسمي.\n\n` +
         `📲 *رابط تقييم التطبيق على متجر Google Play:*\n` +
         `https://play.google.com/store/apps/details?id=com.ammarty.ammarty\n\n` +
         `📸 *طريقة استلام الهدية:*\n` +
-        `فقط قم بأخذ لقطة شاشة (سكرين شوت) لتقييمك على المتجر وأرسلها لنا هنا في هذه المحادثة، وسنقوم بتسجيل وتفعيل شهرين الهدية لعمارتكم فوراً! ✨`;
+        `شارك رابط التقييم مع جيرانك في العمارة، وفور إرسال سكرين شوت لـ 3 تقييمات هنا في المحادثة، سيتم تلقائياً تمديد صلاحية عمارتكم شهرين إضافيين فوراً! ✨`;
 
       await sock.sendMessage(targetJid, { text: reviewMsg });
       logEvent('تم إرسال عرض هدية تقييم المتجر بعد التفعيل', { to: targetJid, building: buildingName }, 'success');
@@ -132,16 +155,75 @@ function parseRenewalWhatsAppMessage(text) {
   return { buildingCode, buildingName, years, amount };
 }
 
+// ==================== حفظ واستعادة جلسة واتساب سحابياً في Supabase ====================
+
+async function backupAuthStateToSupabase() {
+  try {
+    if (!fs.existsSync(AUTH_DIR)) return;
+    const files = fs.readdirSync(AUTH_DIR);
+    if (files.length === 0) return;
+    const bundle = {};
+    for (const f of files) {
+      const fullPath = path.join(AUTH_DIR, f);
+      if (fs.statSync(fullPath).isFile()) {
+        bundle[f] = fs.readFileSync(fullPath).toString('base64');
+      }
+    }
+    await supabase.from('building_settings').upsert({
+      building_id: 83,
+      key: 'baileys_session_backup',
+      value: JSON.stringify(bundle),
+      updated_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[Auth Sync] فشل حفظ الجلسة في سوبابايز:', err.message);
+  }
+}
+
+async function restoreAuthStateFromSupabase() {
+  try {
+    const credsPath = path.join(AUTH_DIR, 'creds.json');
+    if (fs.existsSync(credsPath)) return; // الجلسة موجودة محلياً بالفعل
+    const { data, error } = await supabase
+      .from('building_settings')
+      .select('value')
+      .eq('key', 'baileys_session_backup')
+      .maybeSingle();
+    if (error || !data || !data.value) return;
+    const bundle = JSON.parse(data.value);
+    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+    for (const f in bundle) {
+      fs.writeFileSync(path.join(AUTH_DIR, f), Buffer.from(bundle[f], 'base64'));
+    }
+    logEvent('استعادة الجلسة', 'تمت استعادة جلسة واتساب السحابية من سوبابايز بنجاح دون الحاجة لرمز QR!', 'success');
+  } catch (err) {
+    console.error('[Auth Sync] فشل استعادة الجلسة من سوبابايز:', err.message);
+  }
+}
+
 // ==================== إعداد وتشغيل اتصال واتساب ====================
 
 async function initWhatsApp() {
   try {
+    await restoreAuthStateFromSupabase();
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
+    const msgRetryCounterCache = new Map();
+    const retryCache = {
+      get: (k) => msgRetryCounterCache.get(k),
+      set: (k, v) => msgRetryCounterCache.set(k, v),
+      del: (k) => msgRetryCounterCache.delete(k),
+    };
+    const messageStore = new Map();
 
     sock = makeWASocket({
       auth: state,
-      logger: pino({ level: 'silent' }),
+      logger: pino({ level: 'warn' }),
       printQRInTerminal: true,
+      msgRetryCounterCache: retryCache,
+      getMessage: async (key) => {
+        return messageStore.get(key.id) || undefined;
+      }
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -150,6 +232,9 @@ async function initWhatsApp() {
       if (qr) {
         currentQR = qr;
         isConnected = false;
+        try {
+          QRCode.toFile(path.join(__dirname, 'latest_qr.png'), qr, { width: 400 });
+        } catch (_) {}
         logEvent('واتساب', 'تم إنشاء رمز QR جديد. تفضل بزيارة صفحة /qr لمسحه', 'warning');
       }
 
@@ -165,10 +250,14 @@ async function initWhatsApp() {
         isConnected = true;
         currentQR = null;
         logEvent('واتساب', '✅ متصل ويعمل بنجاح 24/7 جاهز للرد والإرسال التلقائي!', 'success');
+        backupAuthStateToSupabase();
       }
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      await saveCreds();
+      backupAuthStateToSupabase();
+    });
 
     const processedMsgIds = new Set();
 
@@ -177,7 +266,10 @@ async function initWhatsApp() {
       if (type !== 'notify' && type !== 'append') return;
 
       for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe || msg.key.remoteJid.includes('@g.us')) continue;
+        if (!msg.message || msg.key.remoteJid.includes('@g.us')) continue;
+
+        // تجاهل الرسائل الصادرة من البوت للآخرين، مع السماح برسائل المدير في المحادثة الذاتية (Message Yourself)
+        if (msg.key.fromMe && !isAdminUser(msg.key.remoteJid, '')) continue;
 
         // منع تكرار معالجة الرسائل ذات نفس المعرف (ID deduplication)
         if (msg.key?.id) {
@@ -186,6 +278,13 @@ async function initWhatsApp() {
           if (processedMsgIds.size > 2000) {
             const oldest = processedMsgIds.values().next().value;
             processedMsgIds.delete(oldest);
+          }
+          if (msg.message) {
+            messageStore.set(msg.key.id, msg.message);
+            if (messageStore.size > 2000) {
+              const oldKey = messageStore.keys().next().value;
+              messageStore.delete(oldKey);
+            }
           }
         }
 
@@ -199,11 +298,47 @@ async function initWhatsApp() {
         }
 
         const senderJid = msg.key.remoteJid;
-        const senderPhone = senderJid.replace(/[^\d]/g, '');
+        const cleanSenderPhone = senderJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+        const senderPhone = cleanSenderPhone;
         const text =
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
+          msg.message.imageMessage?.caption ||
+          msg.message.videoMessage?.caption ||
+          msg.message.documentMessage?.caption ||
+          msg.message.viewOnceMessage?.message?.imageMessage?.caption ||
+          msg.message.viewOnceMessageV2?.message?.imageMessage?.caption ||
           '';
+
+        const isImage = !!(
+          msg.message?.imageMessage ||
+          msg.message?.viewOnceMessage?.message?.imageMessage ||
+          msg.message?.viewOnceMessageV2?.message?.imageMessage ||
+          (msg.message?.documentMessage?.mimetype?.startsWith('image/'))
+        );
+
+        // ==================== 0. التحقق من مدير ومطور النظام (المهندس محمود أحمد) ====================
+        if (isAdminUser(senderJid, senderPhone)) {
+          logEvent('مدير ومطور النظام (م. محمود)', { from: senderPhone, text: text.slice(0, 80), isImage }, 'success');
+          try {
+            await handleAdminMessage({
+              sock,
+              msg,
+              senderJid,
+              senderPhone,
+              text,
+              isImage,
+              supabase,
+              logEvent
+            });
+          } catch (admErr) {
+            logEvent('خطأ معالجة رسالة المدير', admErr.message, 'error');
+            await sock.sendMessage(senderJid, {
+              text: `أهلاً بحضرتك يا باشمهندس محمود 👑\nحدث خطأ غير متوقع أثناء معالجة الطلب: ${admErr.message}.\nالسيرفر يعمل بكامل كفاءته ويمكنك المحاولة مجدداً.`
+            });
+          }
+          continue;
+        }
 
         logEvent('رسالة واتساب واردة', { from: senderPhone, text: text.slice(0, 80) });
 
@@ -277,13 +412,6 @@ async function initWhatsApp() {
         }
 
         // ---------- 2. فحص إرسال صورة إيصال التحويل (OCR) أو إشعار سداد معلق ----------
-        const isImage = !!(
-          msg.message?.imageMessage ||
-          msg.message?.viewOnceMessage?.message?.imageMessage ||
-          msg.message?.viewOnceMessageV2?.message?.imageMessage ||
-          (msg.message?.documentMessage?.mimetype?.startsWith('image/'))
-        );
-
         const isProofText = /(?:تم\s*التحويل|حولت|دفعت|تم\s*الدفع|مرفق\s*(?:إشعار|الايصال|الإيصال|الوصل)|المرجع|رقم\s*المعاملة|رقم\s*العملية)/i.test(text) ||
                             /\b(0244\d{8}|9d6e\w{4}|\d{10,16})\b/i.test(text);
 
@@ -312,8 +440,12 @@ async function initWhatsApp() {
             if ((isReviewIntent || isOcrReview) && !hasPaymentMarkers) {
               logEvent('تم رصد سكرين شوت تقييم المتجر', senderPhone, 'info');
 
-              // البحث عن عمارة العميل بواسطة رقم الهاتف
+              // 1. استخراج الأرقام لتحديد هوية العميل
               const cleanPhone = senderPhone.replace(/^20/, '0');
+              const short9 = cleanPhone.slice(-9);
+
+              // 2. البحث عن عمارة العميل
+              // أ) البحث في مديري العمارات
               const { data: bldCandidates } = await supabase
                 .from('buildings')
                 .select('*, building_subscriptions(*)')
@@ -321,11 +453,221 @@ async function initWhatsApp() {
                 .order('id', { ascending: false });
 
               let matchedBld = bldCandidates && bldCandidates.length > 0 ? bldCandidates[0] : null;
+              let reviewerRole = 'مدير العمارة';
+              let matchedResidentApt = null;
+              let isManager = !!matchedBld;
 
-              if (matchedBld) {
-                const currentExpiry = matchedBld.building_subscriptions && matchedBld.building_subscriptions.length > 0
-                  ? matchedBld.building_subscriptions[0].expiry_date
-                  : null;
+              // ب) إذا لم يكن مديراً، البحث في جدول السكان والشقق (apartments)
+              if (!matchedBld) {
+                const { data: aptCandidates } = await supabase
+                  .from('apartments')
+                  .select('building_id, apt_number, owner_name, phone')
+                  .ilike('phone', `%${short9}%`)
+                  .limit(1);
+
+                if (aptCandidates && aptCandidates.length > 0) {
+                  matchedResidentApt = aptCandidates[0];
+                  const { data: aptBld } = await supabase
+                    .from('buildings')
+                    .select('*, building_subscriptions(*)')
+                    .eq('id', matchedResidentApt.building_id)
+                    .maybeSingle();
+
+                  if (aptBld) {
+                    matchedBld = aptBld;
+                    reviewerRole = `الساكن / شقة ${matchedResidentApt.apt_number || ''}`;
+                    isManager = false;
+                  }
+                }
+              }
+
+              // ج) البحث عبر كود العمارة إذا ذكره العميل في النص أو الكابشن
+              if (!matchedBld && text) {
+                const codeMatch = text.match(/BLD-?[0-9]{4}/i) || text.match(/[0-9]{4}/);
+                if (codeMatch) {
+                  const digits = codeMatch[0].match(/[0-9]{4}/);
+                  if (digits) {
+                    const codeStr = 'BLD-' + digits[0];
+                    const { data: codeBld } = await supabase
+                      .from('buildings')
+                      .select('*, building_subscriptions(*)')
+                      .eq('code', codeStr)
+                      .maybeSingle();
+
+                    if (codeBld) {
+                      matchedBld = codeBld;
+                      reviewerRole = 'ساكن بالعمارة';
+                      isManager = codeBld.manager_phone && codeBld.manager_phone.replace(/\D/g, '').endsWith(short9);
+                    }
+                  }
+                }
+              }
+
+              // إذا تعذر تحديد العمارة إطلاقاً
+              if (!matchedBld) {
+                const guestThanksMsg =
+                  `🎉 *شكراً جزيلاً لذوقكم وتقييمكم الرائع لتطبيق عمارتي على المتجر!* ⭐⭐⭐⭐⭐\n\n` +
+                  `تم استلام سكرين شوت التقييم بنجاح 📸\n\n` +
+                  `لحساب هذا التقييم ضمن تحدي عمارتكم (*3 تقييمات لكسب شهرين مجاناً 60 يوماً* لعمارتكم بالكامل)، يرجى كتابة *كود العمارة (مثل: BLD-1234)* أو *اسم العمارة المسجلة* لربط التقييم بعمارتكم واحتسابه فوراً في العداد! 🏢✨`;
+                await sock.sendMessage(senderJid, { text: guestThanksMsg });
+                logEvent('تم استلام سكرين شوت تقييم لعميل غير محدد الكود', senderPhone, 'info');
+                continue;
+              }
+
+              // 3. فحص هل حصلت العمارة بالفعل على هدية التقييم مسبقاً
+              const { data: claimedRow } = await supabase
+                .from('building_settings')
+                .select('value')
+                .eq('building_id', matchedBld.id)
+                .eq('key', 'review_gift_claimed')
+                .maybeSingle();
+
+              if (claimedRow && claimedRow.value) {
+                const alreadyClaimedMsg =
+                  `🎉 *شكراً جزيلاً لكم ولدعمكم المستمر!* ⭐⭐⭐⭐⭐\n\n` +
+                  `عمارة (*${matchedBld.name}* - كود: *${matchedBld.code}*) قد حصلت بالفعل على هدية التقييم الكاملة (**شهرين مجاناً - 60 يوماً**) مسبقاً! 🥳🎁\n\n` +
+                  `نعتز ونفخر جداً بثقتكم ووجودكم معنا في عائلة عمارتي 🏢✨`;
+                await sock.sendMessage(senderJid, { text: alreadyClaimedMsg });
+                logEvent('العمارة حصلت على الهدية مسبقاً', { building: matchedBld.code, phone: senderPhone }, 'info');
+                continue;
+              }
+
+              // 4. قراءة سجل العداد الحالي للتقييمات
+              const { data: progRow } = await supabase
+                .from('building_settings')
+                .select('value')
+                .eq('building_id', matchedBld.id)
+                .eq('key', 'review_gift_progress')
+                .maybeSingle();
+
+              let progress = { count: 0, reviews: [] };
+              if (progRow && progRow.value) {
+                try {
+                  progress = JSON.parse(progRow.value);
+                } catch (_) {}
+              }
+              if (!Array.isArray(progress.reviews)) {
+                progress.reviews = [];
+              }
+
+              // 5. التحقق من منع تكرار نفس الرقم
+              const alreadyReviewed = progress.reviews.some(r => {
+                const rShort = String(r.phone || r.clean_phone || '').replace(/\D/g, '').slice(-9);
+                return rShort === short9;
+              });
+
+              if (alreadyReviewed) {
+                const currentCount = progress.reviews.length;
+                const remainingCount = Math.max(0, 3 - currentCount);
+                const duplicateMsg =
+                  `🎉 *شكراً جزيلاً لحرصكم وذوقكم الراقي!* ⭐⭐⭐⭐⭐\n\n` +
+                  `لقد قمت بالفعل بتسجيل تقييمك لصالح عمارة (*${matchedBld.name}* - كود: *${matchedBld.code}*) مسبقاً وهو محسوب في العداد ✅\n\n` +
+                  `📊 *حالة تحدي الهدية لعمارتكم حتى الآن:*\n` +
+                  `• المنجز: *${currentCount} من أصل 3 تقييمات* 🌟\n` +
+                  `• المطلوب: متبقي *${remainingCount} ${remainingCount === 1 ? 'تقييم واحد فقط' : 'تقييمين'} من جيرانكم في العمارة* لتفعيل الشهرين المجانيين (60 يوماً) لعمارتكم بالكامل! 🎁🏢\n\n` +
+                  `📲 شجع جيرانك وباقي سكان العمارة على كتابة تقييمهم وإرسال السكرين شوت هنا لإكمال التحدي:\n` +
+                  `https://play.google.com/store/apps/details?id=com.ammarty.ammarty`;
+
+                await sock.sendMessage(senderJid, { text: duplicateMsg });
+                logEvent('تقييم مكرر لنفس الرقم', { building: matchedBld.code, phone: senderPhone }, 'info');
+                continue;
+              }
+
+              // 6. إضافة التقييم الجديد للعداد وحفظه
+              progress.reviews.push({
+                phone: senderPhone,
+                clean_phone: cleanPhone,
+                role: reviewerRole,
+                submitted_at: new Date().toISOString()
+              });
+              progress.count = progress.reviews.length;
+
+              await supabase
+                .from('building_settings')
+                .upsert({
+                  building_id: matchedBld.id,
+                  key: 'review_gift_progress',
+                  value: JSON.stringify(progress),
+                  updated_at: new Date().toISOString()
+                });
+
+              // فحص هل تمتلك العمارة اشتراكاً رسمياً مدفوعاً أم أنها ما زالت في فترة التجربة المجانية
+              const currentSubscriptions = matchedBld.building_subscriptions || [];
+              const paidSubs = currentSubscriptions.filter(s => s.is_trial === false && (Number(s.price_paid) > 0 || Number(s.years_count) > 0));
+              paidSubs.sort((a, b) => new Date(b.expiry_date || 0) - new Date(a.expiry_date || 0));
+              const activePaidSub = paidSubs.length > 0 ? paidSubs[0] : null;
+              const hasPaidPlan = !!activePaidSub;
+
+              // 7. إذا كان العداد أقل من 3 (التقييم الأول أو الثاني)
+              if (progress.count < 3) {
+                const remaining = 3 - progress.count;
+                let progressMsg = '';
+
+                if (hasPaidPlan) {
+                  progressMsg =
+                    `🎉 *شكراً جزيلاً لذوقكم وتقييمكم الرائع لتطبيق عمارتي!* ⭐⭐⭐⭐⭐\n\n` +
+                    `تم بنجاح توثيق تقييمكم لصالح عمارة (*${matchedBld.name}* - كود: *${matchedBld.code}*)! 🥳✨\n\n` +
+                    `📊 *عداد تحدي الهدية الكبرى:*\n` +
+                    `✅ تم تسجيل: *${progress.count} من أصل 3 تقييمات* (${reviewerRole}) 🌟\n` +
+                    `⏳ متبقي: *${remaining} ${remaining === 1 ? 'تقييم واحد فقط' : 'تقييمين'} من جيرانكم في العمارة* لتفعيل الهدية (**شهرين إضافيين مجاناً - 60 يوماً**) كزيادة رسمية فوق مدة اشتراككم المدفوع الحالي! 🎁🏢\n\n` +
+                    `📲 شاركوا رابط التطبيق مع باقي السكان في جروب العمارة ليقوموا بالتقييم وإرسال السكرين شوت هنا:\n` +
+                    `https://play.google.com/store/apps/details?id=com.ammarty.ammarty\n\n` +
+                    `خطوة واحدة تفصلكم عن الهدية! 🚀`;
+                } else {
+                  progressMsg =
+                    `🎉 *شكراً جزيلاً لذوقكم وتقييمكم الرائع لتطبيق عمارتي!* ⭐⭐⭐⭐⭐\n\n` +
+                    `تم بنجاح توثيق تقييمكم لصالح عمارة (*${matchedBld.name}* - كود: *${matchedBld.code}*)! 🥳✨\n\n` +
+                    `📊 *عداد تحدي الهدية المسجل لعمارتكم:*\n` +
+                    `✅ تم تسجيل: *${progress.count} من أصل 3 تقييمات* (${reviewerRole}) 🌟\n` +
+                    `⏳ متبقي: *${remaining} ${remaining === 1 ? 'تقييم واحد فقط' : 'تقييمين'} من جيرانكم في العمارة* لاكتمال التحدي! 🎁🏢\n\n` +
+                    `⚠️ *توضيح هام بخصوص الهدية:* 🎁\n` +
+                    `هدية **الشهرين الإضافيين (60 يوماً)** هي ميزة خاصة تُمنح **زيادة فوق مدة الاشتراك الرسمي المدفوع** عند الاشتراك في أي باقة رسمية (سنة، سنتين، 3 سنوات) ولا تُمنح كفترة منفصلة بدون اشتراك رسمي.\n` +
+                    `بمجرد اشتراك وتفعيل عمارتكم، ستتم تلقائياً إضافة الشهرين الهدية كزيادة فورية فوق مدة باقتكم (مثال: اشتراك سنة = 14 شهراً بالكامل)! 🏢✨\n\n` +
+                    `📲 شاركوا رابط التطبيق مع باقي السكان ليقوموا بالتقييم لإكمال التحدي:\n` +
+                    `https://play.google.com/store/apps/details?id=com.ammarty.ammarty`;
+                }
+
+                await sock.sendMessage(senderJid, { text: progressMsg });
+                logEvent('تم تسجيل تقييم جديد في التحدي', { building: matchedBld.code, count: progress.count, phone: senderPhone }, 'success');
+
+                // إشعار لمدير العمارة إذا كان المقيم شخصاً آخر غير المدير
+                if (!isManager && matchedBld.manager_phone) {
+                  try {
+                    const mgrPhoneClean = matchedBld.manager_phone.replace(/\D/g, '').replace(/^0/, '20');
+                    const mgrJid = `${mgrPhoneClean}@s.whatsapp.net`;
+                    const mgrNotifyMsg =
+                      `📢 *إشعار تحدي الهدية لعمارة (${matchedBld.name})* 🏢\n\n` +
+                      `أستاذ *${matchedBld.manager_name || 'المدير'}*، قام أحد سكان عمارتكم (${reviewerRole}) للتو بإرسال تقييم 5 نجوم على Google Play! ⭐⭐⭐⭐⭐\n\n` +
+                      `📊 العداد الحالي: *${progress.count} من 3 تقييمات*\n` +
+                      `⏳ متبقي فقط: *${remaining} تقييم* لكسب **شهرين زيادة فوق الاشتراك المدفوع (60 يوماً)** لعمارتكم بالكامل!\n\n` +
+                      `شجع باقي السكان ليكتبوا تقييمهم ويرسلوا السكرين شوت هنا في الشات 🚀`;
+                    await sock.sendMessage(mgrJid, { text: mgrNotifyMsg });
+                  } catch (errMgr) {
+                    logEvent('تعذر إرسال إشعار التقييم للمدير', errMgr.message, 'warning');
+                  }
+                }
+                continue;
+              }
+
+              // 8. اكتمل التحدي! وصول التقييم رقم 3! 🥳🎉
+              if (hasPaidPlan) {
+                // العمارة مشتركة بالفعل باشتراك مدفوع -> تمديد 60 يوماً فوراً فوق اشتراكها
+                const baseDate = activePaidSub.expiry_date
+                  ? new Date(Math.max(new Date(activePaidSub.expiry_date).getTime(), Date.now()))
+                  : new Date();
+
+                const newExpiry = new Date(baseDate);
+                newExpiry.setDate(newExpiry.getDate() + 60);
+
+                await supabase
+                  .from('building_subscriptions')
+                  .update({
+                    expiry_date: newExpiry.toISOString(),
+                    notes: (activePaidSub.notes ? activePaidSub.notes + ' | ' : '') + 'تمت إضافة هدية شهرين مجاناً (60 يوماً) زيادة فوق الاشتراك الرسمي بعد اكتمال 3 تقييمات'
+                  })
+                  .eq('id', activePaidSub.id);
+
+                await supabase.from('buildings').update({ is_active: true }).eq('id', matchedBld.id);
 
                 await supabase
                   .from('building_settings')
@@ -339,34 +681,114 @@ async function initWhatsApp() {
                       building_code: matchedBld.code,
                       building_name: matchedBld.name,
                       manager_name: matchedBld.manager_name,
-                      manager_phone: senderPhone,
+                      manager_phone: matchedBld.manager_phone,
+                      reviewers: progress.reviews,
                       claimed_at: new Date().toISOString(),
-                      current_expiry: currentExpiry,
-                      note: 'هدية شهرين مجاناً (60 يوماً) بعد انتهاء فترة الاشتراك الحالي'
+                      new_expiry: newExpiry.toISOString(),
+                      note: 'تم تفعيل هدية شهرين مجاناً (60 يوماً) زيادة فوق الاشتراك الرسمي بعد اكتمال 3 تقييمات'
                     }),
                     updated_at: new Date().toISOString()
                   });
 
-                const formattedExpiry = currentExpiry ? formatDate(currentExpiry) : 'نهاية الاشتراك الحالي';
+                const formattedNewExpiry = formatDate(newExpiry);
 
-                const reviewThanksMsg =
-                  `🎉 *شكراً جزيلاً لذوقكم وتقييمكم الرائع لتطبيق عمارتي!* ⭐⭐⭐⭐⭐\n\n` +
-                  `أستاذ *${matchedBld.manager_name || 'المدير'}*، تم بنجاح استلام وتوثيق لقطة شاشة تقييم عمارتكم الموقرة (*${matchedBld.name}* - كود: *${matchedBld.code}*) على متجر Google Play! 🥳✨\n\n` +
-                  `🎁 *تم تسجيل هديتكم الخاصة رسمياً:* **شهرين إضافيين مجاناً (60 يوماً)**.\n` +
-                  `📅 ستتم إضافتها وتفعيلها لعمارتكم مباشرة بعد انتهاء فترة اشتراككم الحالي في *${formattedExpiry}* تقديراً لدعمكم الغالي.\n\n` +
-                  `فريق عمل "عمارتي" يتمنى لكم ولجميع سكان العقار تجربة إدارة ممتازة دائماً 🚀`;
+                // إرسال رسالة التهنئة الكبرى لصاحب التقييم الثالث
+                const goalAchievedMsg =
+                  `🎉🎊 *ألف مبرووووك! اكتمل تحدي التقييم لعمارتكم بنجاح!* 🌟⭐⭐⭐⭐⭐\n\n` +
+                  `بفضل تقييمكم المميز، اكتمل الآن تقييم **3 أفراد من عمارة (*${matchedBld.name}* - كود: *${matchedBld.code}*)** على متجر Google Play! 🥳✨\n\n` +
+                  `🎁 *تم رسمياً تفعيل الهدية لعمارتكم:* **شهرين إضافيين مجاناً (60 يوماً)**.\n` +
+                  `📅 تمت إضافتها كزيادة رسمية فوق مدة اشتراككم المدفوع الحالي ليصبح تاريخ الانتهاء الجديد: *${formattedNewExpiry}* في تطبيق عمارتي دون أي تكلفة إضافية! 🏢🎉\n\n` +
+                  `كل الشكر والتقدير لكم ولجميع جيرانكم في العمارة على هذا الدعم الرائع 🚀`;
 
-                await sock.sendMessage(senderJid, { text: reviewThanksMsg });
-                logEvent('تم توثيق هدية تقييم المتجر بنجاح', { building: matchedBld.code, phone: senderPhone }, 'success');
-                continue;
+                await sock.sendMessage(senderJid, { text: goalAchievedMsg });
+
+                // إشعار مدير العمارة إذا كان شخصاً آخر
+                if (!isManager && matchedBld.manager_phone) {
+                  try {
+                    const mgrPhoneClean = matchedBld.manager_phone.replace(/\D/g, '').replace(/^0/, '20');
+                    const mgrJid = `${mgrPhoneClean}@s.whatsapp.net`;
+                    const mgrCelebrationMsg =
+                      `🎉🎊 *بشرى سارة لمدير العمارة أستاذ ${matchedBld.manager_name || 'المدير'}!* 🌟🏢\n\n` +
+                      `يسعدنا إبلاغ سيادتكم باكتمال تحدي الهدية لعمارة (*${matchedBld.name}*) بتسجيل **3 تقييمات 5 نجوم** من سكان وإدارة العمارة على متجر Google Play! ⭐⭐⭐⭐⭐\n\n` +
+                      `🎁 *تم تفعيل الهدية رسمياً:* **شهرين إضافيين مجاناً (60 يوماً)** أُضيفت كزيادة رسمية فوق مدة اشتراككم المدفوع ليصبح تاريخ الانتهاء الجديد: *${formattedNewExpiry}*! 🥳✨\n\n` +
+                      `دمتم في أمان الله ورعايته، وتمنياتنا لجميع السكان بتجربة ممتازة 🌸`;
+                    await sock.sendMessage(mgrJid, { text: mgrCelebrationMsg });
+                  } catch (errMgr) {}
+                }
+
+                // إشعار لمدير النظام والمالك م/ محمود أحمد (01021252626)
+                try {
+                  const adminJid = '201021252626@s.whatsapp.net';
+                  const adminMsg =
+                    `🎁 *إشعار نظام: اكتمال تحدي تقييم المتجر وتفعيل الهدية (شهرين زيادة)* 🏢\n\n` +
+                    `• العمارة: *${matchedBld.name}* (${matchedBld.code})\n` +
+                    `• المدير: ${matchedBld.manager_name} (${matchedBld.manager_phone})\n` +
+                    `• المنجز: 3 تقييمات مكتملة ✅\n` +
+                    `• تاريخ الانتهاء الجديد: *${formattedNewExpiry}*\n` +
+                    `• تمت إضافة 60 يوماً زيادة فوق الاشتراك المدفوع بنجاح.`;
+                  await sock.sendMessage(adminJid, { text: adminMsg });
+                } catch (errAdmin) {}
+
+                logEvent('تم اكتمال تحدي تقييم المتجر وتفعيل شهرين زيادة فوق الاشتراك المدفوع', { building: matchedBld.code }, 'success');
               } else {
-                const guestThanksMsg =
-                  `🎉 *شكراً جزيلاً لذوقكم وتقييمكم الرائع لتطبيق عمارتي على المتجر!* ⭐⭐⭐⭐⭐\n\n` +
-                  `تم استلام سكرين شوت التقييم بنجاح. للحصول على هدية **الشهرين المجانيين (60 يوماً)** لعمارتكم، يرجى تزويدنا بـ *كود العمارة* أو *اسم العمارة المسجلة* لربط وتوثيق الهدية فوراً في حسابكم 🏢✨`;
-                await sock.sendMessage(senderJid, { text: guestThanksMsg });
-                logEvent('تم استلام سكرين شوت تقييم لعميل غير محدد الكود', senderPhone, 'info');
-                continue;
+                // العمارة لم تشترك بعد (ما زالت تجربة مجانية أو غير مدفوعة)
+                // يتم حجز الهدية رسمياً وإضافتها تلقائياً فور سداد الاشتراك
+                await supabase
+                  .from('building_settings')
+                  .upsert({
+                    building_id: matchedBld.id,
+                    key: 'review_gift_pending_subscription',
+                    value: JSON.stringify({
+                      status: 'ready_for_bonus',
+                      bonus_days: 60,
+                      building_id: matchedBld.id,
+                      building_code: matchedBld.code,
+                      building_name: matchedBld.name,
+                      manager_name: matchedBld.manager_name,
+                      manager_phone: matchedBld.manager_phone,
+                      reviewers: progress.reviews,
+                      completed_at: new Date().toISOString(),
+                      note: 'اكتملت 3 تقييمات وجاهزة للإضافة فور سداد الاشتراك الرسمي المدفوع'
+                    }),
+                    updated_at: new Date().toISOString()
+                  });
+
+                const pendingSubNotice =
+                  `🎉🎊 *رائع جداً! اكتمل تحدي التقييم لعمارتكم بنجاح (3 من 3 تقييمات)!* 🌟⭐⭐⭐⭐⭐\n\n` +
+                  `أستاذ *${matchedBld.manager_name || 'المدير'}*، تم بنجاح توثيق تقييمات الـ 3 أفراد وحجز هدية عمارتكم (*${matchedBld.name}* - كود: *${matchedBld.code}*): **شهرين إضافيين مجاناً (60 يوماً)** في حسابكم! 🥳🎁\n\n` +
+                  `📌 *توضيح هام لتفعيل الهدية:* 🎁\n` +
+                  `نظام الهدية يمنح الشهرين **زيادة فوق مدة الاشتراك الرسمي المدفوع** لعمارتكم (ولا يُمنح كفترة منفصلة بدون اشتراك رسمي).\n` +
+                  `لذلك، بمجرد اشتراككم في أي باقة رسمية (سنة، سنتين، 3 سنوات)، سيقوم النظام آلياً بإضافة الشهرين الهدية كزيادة فورية فوق مدة الاشتراك مباشرة (مثال: باقة سنة = 14 شهراً بالكامل)! 🏢✨\n\n` +
+                  `📋 *باقات الاشتراك الرسمية لعمارتكم:*\n` +
+                  `• سنة: 200 ج.م (+ شهرين هدية = 14 شهراً) 🌟\n` +
+                  `• سنتان: 360 ج.م (+ شهرين هدية = 26 شهراً)\n` +
+                  `• 3 سنوات: 480 ج.م (+ شهرين هدية = 38 شهراً)\n\n` +
+                  `💳 التحويل عبر إنستاباي أو فودافون كاش على الرقم المعتمد: *01021252626*\n` +
+                  `وفور إرسال إيصال التحويل، سيتم فورياً تفعيل الاشتراك الرسمي شاملاً الشهرين الهدية معاً! 🚀`;
+
+                await sock.sendMessage(senderJid, { text: pendingSubNotice });
+
+                if (!isManager && matchedBld.manager_phone) {
+                  try {
+                    const mgrPhoneClean = matchedBld.manager_phone.replace(/\D/g, '').replace(/^0/, '20');
+                    const mgrJid = `${mgrPhoneClean}@s.whatsapp.net`;
+                    await sock.sendMessage(mgrJid, { text: pendingSubNotice });
+                  } catch (errMgr) {}
+                }
+
+                try {
+                  const adminJid = '201021252626@s.whatsapp.net';
+                  const adminMsg =
+                    `🎁 *إشعار نظام: اكتمل تحدي التقييم (بانتظار تفعيل الاشتراك الرسمي)* 🏢\n\n` +
+                    `• العمارة: *${matchedBld.name}* (${matchedBld.code})\n` +
+                    `• المدير: ${matchedBld.manager_name} (${matchedBld.manager_phone})\n` +
+                    `• المنجز: 3 تقييمات مكتملة ومحجوزة لإضافة 60 يوماً زيادة فور سداد الاشتراك المدفوع ✅`;
+                  await sock.sendMessage(adminJid, { text: adminMsg });
+                } catch (errAdmin) {}
+
+                logEvent('اكتملت 3 تقييمات وبانتظار سداد الاشتراك لإضافة الشهرين', { building: matchedBld.code }, 'info');
               }
+              continue;
             }
 
             // إذا لم تكن سكرين شوت تقييم، فهي إيصال تحويل مالي
@@ -466,6 +888,32 @@ async function initWhatsApp() {
                 const expiryDate = new Date();
                 expiryDate.setFullYear(startDate.getFullYear() + yearsCount);
 
+                // فحص هل العمارة مؤهلة لهدية التقييم (شهرين إضافيين زيادة فوق مدة الاشتراك)
+                const { data: revGiftRows } = await supabase
+                  .from('building_settings')
+                  .select('key, value')
+                  .eq('building_id', building.id)
+                  .in('key', ['review_gift_claimed', 'review_gift_progress', 'review_gift_pending_subscription']);
+
+                const hasClaimedGift = revGiftRows?.some(r => r.key === 'review_gift_claimed');
+                const progRow = revGiftRows?.find(r => r.key === 'review_gift_progress');
+                const pendGiftRow = revGiftRows?.find(r => r.key === 'review_gift_pending_subscription');
+
+                let earnedReviewBonus = false;
+                if (!hasClaimedGift) {
+                  let pCount = pendGiftRow ? 3 : 0;
+                  if (progRow && progRow.value) {
+                    try {
+                      const p = JSON.parse(progRow.value);
+                      pCount = Math.max(pCount, p.count || (p.reviews ? p.reviews.length : 0));
+                    } catch (_) {}
+                  }
+                  if (pCount >= 3) {
+                    earnedReviewBonus = true;
+                    expiryDate.setDate(expiryDate.getDate() + 60); // إضافة 60 يوماً زيادة فوق مدة الاشتراك
+                  }
+                }
+
                 // 1. تفعيل الاشتراك في سوبابايز
                 const { data: subData } = await supabase
                   .from('building_subscriptions')
@@ -478,9 +926,28 @@ async function initWhatsApp() {
                     expiry_date: expiryDate.toISOString(),
                     is_active: true,
                     is_trial: false,
-                    notes: `تفعيل ذكي مؤكد عبر مطابقة التحويل البنكي الفعلي (مرجع: ${resolvedTxnId})`
+                    notes: `تفعيل ذكي مؤكد عبر مطابقة التحويل البنكي الفعلي (مرجع: ${resolvedTxnId})` + (earnedReviewBonus ? ' + شهرين زيادة هدية اكتمال 3 تقييمات' : '')
                   }])
                   .select();
+
+                if (earnedReviewBonus) {
+                  await supabase
+                    .from('building_settings')
+                    .upsert({
+                      building_id: building.id,
+                      key: 'review_gift_claimed',
+                      value: JSON.stringify({
+                        status: 'claimed',
+                        bonus_days: 60,
+                        building_id: building.id,
+                        building_code: building.code,
+                        claimed_at: new Date().toISOString(),
+                        new_expiry: expiryDate.toISOString(),
+                        note: 'تم تفعيل هدية شهرين إضافيين مع الاشتراك المدفوع بعد اكتمال 3 تقييمات'
+                      }),
+                      updated_at: new Date().toISOString()
+                    });
+                }
 
                 const newSubId = (subData && subData[0]) ? subData[0].id : Date.now().toString().slice(-4);
                 await supabase.from('buildings').update({ is_active: true }).eq('id', building.id);
@@ -551,7 +1018,7 @@ async function initWhatsApp() {
                   `أستاذ *${building.manager_name || 'المدير'}*، تم بنجاح التحقق من الإشعار البنكي ومطابقة عملية السداد (رقم المرجع: *${resolvedTxnId}*).\n\n` +
                   `✅ *تفاصيل الترخيص المعتمد:*\n` +
                   `• العمارة: *${building.name}* (كود: *${building.code}*)\n` +
-                  `• مدة الاشتراك: *${yearsText}*\n` +
+                  `• مدة الاشتراك: *${yearsText}*` + (earnedReviewBonus ? ` *(+ شهرين زيادة هدية تقييم المتجر 🎁)*` : '') + `\n` +
                   `• تاريخ الصلاحية حتى: *${formatDate(expiryDate)}*\n` +
                   `• رقم الفاتورة الرسمية: *${invoiceNo}*\n\n` +
                   `نظام عمارتكم الآن نشط ومتاح بالكامل لجميع السكان ومجلس الإدارة.\n` +
@@ -690,6 +1157,21 @@ async function initWhatsApp() {
           continue;
         }
 
+        // ---------- 3.5 فحص الرد على عرض تجديد الاشتراك التجريبي (نعم / لا) ----------
+        try {
+          const handledTrialReply = await handleTrialReminderResponse({
+            supabase,
+            sock,
+            senderJid,
+            senderPhone,
+            text,
+            logEvent
+          });
+          if (handledTrialReply) continue;
+        } catch (trErr) {
+          logEvent('خطأ معالجة رد التجربة', trErr.message, 'warning');
+        }
+
         // ---------- 4. خدمة العملاء والرد الذكي بالذكاء الاصطناعي (Gemini) ----------
         if (text && text.trim().length > 1) {
           try {
@@ -736,6 +1218,22 @@ async function initWhatsApp() {
 }
 
 initWhatsApp();
+
+// ==================== الجدولة التلقائية لتنبيهات الاشتراكات التجريبية ====================
+// فحص دوري كل ساعتين، وإرسال التنبيهات تلقائياً في الفترة الصباحية (بين 11:00 ص و 13:00 م بتوقيت مصر)
+setInterval(async () => {
+  try {
+    if (!sock || !isConnected) return;
+    const now = new Date();
+    const cairoHour = (now.getUTCHours() + 2) % 24; // توقيت القاهرة (UTC+2)
+    if (cairoHour >= 11 && cairoHour <= 13) {
+      logEvent('فحص التنبيهات المجدول', 'بدء الفحص اليومي للاشتراكات التجريبية التي تقترب من الانتهاء...');
+      await checkAndSendTrialReminders({ supabase, sock, logEvent });
+    }
+  } catch (cronErr) {
+    logEvent('خطأ الجدولة التلقائية للتجارب', cronErr.message, 'warning');
+  }
+}, 2 * 60 * 60 * 1000);
 
 // ==================== مراقب صندوق الإرسال الآلي (Outbox Poller) ====================
 // محرك متزامن محكم يمنع التكرار نهائياً (Sequential Loop + In-Memory Lock + Immediate DB Lock)
@@ -1132,11 +1630,31 @@ async function processPayment(parsed) {
   const expiryDate = new Date();
   expiryDate.setFullYear(startDate.getFullYear() + yearsCount);
 
-  const formatDate = d => {
-    const day = String(d.getDate()).padStart(2, '0');
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    return `${day} / ${month} / ${d.getFullYear()}`;
-  };
+  // فحص هل العمارة مؤهلة لهدية التقييم (شهرين إضافيين زيادة فوق مدة الاشتراك)
+  const { data: revGiftRows } = await supabase
+    .from('building_settings')
+    .select('key, value')
+    .eq('building_id', matchedBuilding.id)
+    .in('key', ['review_gift_claimed', 'review_gift_progress', 'review_gift_pending_subscription']);
+
+  const hasClaimedGift = revGiftRows?.some(r => r.key === 'review_gift_claimed');
+  const progRow = revGiftRows?.find(r => r.key === 'review_gift_progress');
+  const pendGiftRow = revGiftRows?.find(r => r.key === 'review_gift_pending_subscription');
+
+  let earnedReviewBonus = false;
+  if (!hasClaimedGift) {
+    let pCount = pendGiftRow ? 3 : 0;
+    if (progRow && progRow.value) {
+      try {
+        const p = JSON.parse(progRow.value);
+        pCount = Math.max(pCount, p.count || (p.reviews ? p.reviews.length : 0));
+      } catch (_) {}
+    }
+    if (pCount >= 3) {
+      earnedReviewBonus = true;
+      expiryDate.setDate(expiryDate.getDate() + 60); // إضافة 60 يوماً زيادة فوق مدة الاشتراك
+    }
+  }
 
   // 3. تفعيل الاشتراك في سوبابايز
   const { data: subData, error: subError } = await supabase
@@ -1150,9 +1668,28 @@ async function processPayment(parsed) {
       expiry_date: expiryDate.toISOString(),
       is_active: true,
       is_trial: false,
-      notes: `تفعيل آلي فوري عبر رسالة ${parsed.paymentMethod} (مرجع: ${parsed.transactionId})`
+      notes: `تفعيل آلي فوري عبر رسالة ${parsed.paymentMethod} (مرجع: ${parsed.transactionId})` + (earnedReviewBonus ? ' + شهرين زيادة هدية اكتمال 3 تقييمات' : '')
     }])
     .select();
+
+  if (earnedReviewBonus) {
+    await supabase
+      .from('building_settings')
+      .upsert({
+        building_id: matchedBuilding.id,
+        key: 'review_gift_claimed',
+        value: JSON.stringify({
+          status: 'claimed',
+          bonus_days: 60,
+          building_id: matchedBuilding.id,
+          building_code: matchedBuilding.code,
+          claimed_at: new Date().toISOString(),
+          new_expiry: expiryDate.toISOString(),
+          note: 'تم تفعيل هدية شهرين إضافيين مع الاشتراك المدفوع بعد اكتمال 3 تقييمات'
+        }),
+        updated_at: new Date().toISOString()
+      });
+  }
 
   const newSubId = (subData && subData[0]) ? subData[0].id : Date.now().toString().slice(-4);
   await supabase.from('buildings').update({ is_active: true }).eq('id', matchedBuilding.id);
@@ -1387,6 +1924,94 @@ app.get('/qr', async (req, res) => {
   }
 });
 
+// نقطة إعادة ضبط وربط جلسة واتساب من الصفر في حال تلف مفاتيح التشفير القديمة
+app.get('/relink', async (req, res) => {
+  logEvent('إعادة تعيين الجلسة', 'طلب إعادة ربط واتساب وإنشاء رمز QR جديد نظيف...', 'warning');
+  try {
+    if (sock) {
+      try { sock.end(new Error('Relink requested')); } catch (_) {}
+    }
+    isConnected = false;
+    currentQR = null;
+
+    const backupDir = path.join(__dirname, `auth_info_baileys_backup_${Date.now()}`);
+    if (fs.existsSync(AUTH_DIR)) {
+      try {
+        fs.renameSync(AUTH_DIR, backupDir);
+      } catch (e) {
+        const files = fs.readdirSync(AUTH_DIR);
+        for (const file of files) {
+          try { fs.unlinkSync(path.join(AUTH_DIR, file)); } catch (_) {}
+        }
+      }
+    }
+    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+    try {
+      await supabase.from('building_settings').delete().eq('key', 'baileys_session_backup');
+    } catch (_) {}
+
+    setTimeout(() => {
+      initWhatsApp();
+    }, 1200);
+
+    res.redirect('/qr');
+  } catch (err) {
+    res.status(500).send('Error resetting session: ' + err.message);
+  }
+});
+
+// نقطة جلب أقرب العمائر التي توشك فترتها التجريبية على الانتهاء
+app.get('/api/trial-reminders', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit || '10', 10);
+    const list = await getExpiringTrialBuildings(supabase, { limit });
+    res.json({ ok: true, count: list.length, list });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// نقطة إرسال نموذج تجريبي لرقم م. محمود (01021252626)
+app.post('/api/trial-reminders/test', async (req, res) => {
+  try {
+    if (!sock || !isConnected) {
+      return res.status(400).json({ ok: false, error: 'واتساب غير متصل حالياً' });
+    }
+    const result = await checkAndSendTrialReminders({
+      supabase,
+      sock,
+      logEvent,
+      isManualTrigger: true,
+      limit: 1,
+      targetPhoneOverride: '01021252626'
+    });
+    res.json({ ok: true, message: 'تم إرسال الرسالة التجريبية إلى رقمك الخاص بنجاح', result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// نقطة إرسال التنبيهات الفعلية لأقرب N عمائر
+app.post('/api/trial-reminders/send-live', async (req, res) => {
+  try {
+    if (!sock || !isConnected) {
+      return res.status(400).json({ ok: false, error: 'واتساب غير متصل حالياً' });
+    }
+    const limit = parseInt(req.body?.limit || req.query?.limit || '10', 10);
+    const result = await checkAndSendTrialReminders({
+      supabase,
+      sock,
+      logEvent,
+      isManualTrigger: true,
+      limit
+    });
+    res.json({ ok: true, message: `تم إرسال التنبيهات لـ ${result.sentCount} عمارة بنجاح`, result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // نقطة فحص الحالة البرمجية المباشرة (Health Status API)
 app.get('/api/status', (req, res) => {
   res.json({
@@ -1416,12 +2041,35 @@ app.get('/', (req, res) => {
         .disconnected { background: #fef3c7; color: #92400e; }
         .btn { display: inline-flex; align-items: center; gap: 8px; background: #2563eb; color: white; padding: 10px 20px; border-radius: 10px; text-decoration: none; font-weight: bold; margin: 8px 4px; border: none; cursor: pointer; }
         .btn-wa { background: #25D366; }
+        .btn-warning { background: #d97706; }
+        .btn-purple { background: #7c3aed; }
         .btn:hover { opacity: 0.9; }
+        .section-box { background: #0b0f19; border: 1px solid #334155; border-radius: 12px; padding: 14px; margin-top: 20px; text-align: right; font-size: 13px; color: #94a3b8; }
         .endpoint-box { background: #0b0f19; border: 1px dashed #334155; border-radius: 12px; padding: 14px; margin-top: 20px; text-align: right; font-size: 13px; color: #94a3b8; }
         .code { background: #000; color: #38bdf8; padding: 4px 8px; border-radius: 6px; font-family: monospace; display: block; margin-top: 6px; direction: ltr; text-align: left; }
         .feed { text-align: right; margin-top: 25px; background: #090d16; border-radius: 12px; padding: 15px; font-size: 13px; max-height: 250px; overflow-y: auto; }
         .feed-item { padding: 8px 0; border-bottom: 1px solid #1e293b; }
       </style>
+      <script>
+        async function runTrialTest() {
+          if (!confirm('هل تريد إرسال رسالة تذكير تجريبية لهاتفك الخاص (01021252626)؟')) return;
+          try {
+            const res = await fetch('/api/trial-reminders/test', { method: 'POST' });
+            const data = await res.json();
+            alert(data.message || (data.ok ? 'تم الإرسال بنجاح' : 'حدث خطأ: ' + data.error));
+            location.reload();
+          } catch(e) { alert('خطأ في الاتصال: ' + e.message); }
+        }
+        async function runTrialLive(count) {
+          if (!confirm('تأكيد: هل تريد إرسال رسائل استفسار التجديد لأقرب ' + count + ' عمائر فعلياً؟')) return;
+          try {
+            const res = await fetch('/api/trial-reminders/send-live?limit=' + count, { method: 'POST' });
+            const data = await res.json();
+            alert(data.message || (data.ok ? 'تم الإرسال بنجاح' : 'حدث خطأ: ' + data.error));
+            location.reload();
+          } catch(e) { alert('خطأ في الاتصال: ' + e.message); }
+        }
+      </script>
     </head>
     <body>
       <div class="card">
@@ -1443,8 +2091,19 @@ app.get('/', (req, res) => {
           </div>
         </div>
 
-        <div>
+        <div style="display:flex; justify-content:center; gap:12px; align-items:center; flex-wrap:wrap;">
           ${!isConnected ? '<a href="/qr" class="btn btn-wa"><i class="fa-brands fa-whatsapp"></i> مسح رمز QR لربط واتساب</a>' : '<span style="color:#22c55e; font-weight:bold;"><i class="fa-solid fa-circle-check"></i> واتساب متصل وجاهز للاستقبال والإرسال</span>'}
+          <a href="/relink" class="btn" style="background:#dc2626; color:#fff; text-decoration:none; padding:9px 16px; border-radius:10px; font-size:13px; font-weight:bold; box-shadow:0 4px 12px rgba(220,38,38,0.3);" onclick="return confirm('هل تريد قطع الجلسة الحالية وإنشاء رمز QR جديد لمسحه وإعادة المزامنة النظيفة؟')">🔄 إعادة ربط واتساب (رمز QR جديد)</a>
+        </div>
+
+        <div class="section-box">
+          <strong style="color:#38bdf8; display:block; margin-bottom:6px;"><i class="fa-solid fa-bullhorn"></i> حملة متابعة الاشتراكات التجريبية (أقرب 10 عمائر):</strong>
+          <span style="display:block; margin-bottom:10px;">إرسال استفسار التجديد المهذب بنظام الخيارين (1: نعم، وضح لي / 2: لا، شكراً):</span>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button onclick="runTrialTest()" class="btn btn-purple" style="font-size:13px; padding:8px 14px;"><i class="fa-solid fa-flask"></i> 🧪 تجربة إرسال لهاتفي (01021252626)</button>
+            <button onclick="runTrialLive(10)" class="btn btn-warning" style="font-size:13px; padding:8px 14px;"><i class="fa-solid fa-paper-plane"></i> 🚀 إرسال لأقرب 10 عمائر</button>
+            <a href="/api/trial-reminders?limit=10" target="_blank" class="btn" style="font-size:13px; padding:8px 14px; background:#475569;"><i class="fa-solid fa-eye"></i> كشف الـ 10 عمائر (JSON)</a>
+          </div>
         </div>
 
         <div class="endpoint-box">
