@@ -268,8 +268,8 @@ async function initWhatsApp() {
       for (const msg of messages) {
         if (!msg.message || msg.key.remoteJid.includes('@g.us')) continue;
 
-        // تجاهل الرسائل الصادرة من البوت للآخرين، مع السماح برسائل المدير في المحادثة الذاتية (Message Yourself)
-        if (msg.key.fromMe && !isAdminUser(msg.key.remoteJid, '')) continue;
+        // تجاهل أي رسالة صادرة من البوت نهائياً لمنع أي حلقة تكرار لانهائية
+        if (msg.key.fromMe) continue;
 
         // منع تكرار معالجة الرسائل ذات نفس المعرف (ID deduplication)
         if (msg.key?.id) {

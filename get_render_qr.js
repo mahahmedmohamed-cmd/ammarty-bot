@@ -2,7 +2,8 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const targetPath = 'C:\\Users\\Mahmoud Ahmed\\.gemini\\antigravity-ide\\brain\\44dffa72-95c9-495d-9351-a50d2233380c\\render_qr.png';
+const targetPath = 'C:\\Users\\Mahmoud Ahmed\\.gemini\\antigravity-ide\\brain\\71039dcc-8068-4e2b-8474-22bf9f3c787f\\render_qr.png';
+const localPath = path.join(__dirname, 'latest_qr.png');
 
 https.get('https://ammarty-bot.onrender.com/qr', (res) => {
   let data = '';
@@ -10,7 +11,9 @@ https.get('https://ammarty-bot.onrender.com/qr', (res) => {
   res.on('end', () => {
     const match = data.match(/src="data:image\/png;base64,([^"]+)"/);
     if (match) {
-      fs.writeFileSync(targetPath, Buffer.from(match[1], 'base64'));
+      const buf = Buffer.from(match[1], 'base64');
+      fs.writeFileSync(targetPath, buf);
+      fs.writeFileSync(localPath, buf);
       console.log('SUCCESS: Render QR saved to', targetPath);
     } else {
       console.log('No QR image found, body:', data.slice(0, 300));
