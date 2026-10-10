@@ -2006,12 +2006,14 @@ app.post('/api/trial-reminders/send-live', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'واتساب غير متصل حالياً' });
     }
     const limit = parseInt(req.body?.limit || req.query?.limit || '10', 10);
+    const targetBuildingIds = req.body?.buildingIds || req.body?.targetBuildingIds || null;
     const result = await checkAndSendTrialReminders({
       supabase,
       sock,
       logEvent,
       isManualTrigger: true,
-      limit
+      limit,
+      targetBuildingIds
     });
     res.json({ ok: true, message: `تم إرسال التنبيهات لـ ${result.sentCount} عمارة بنجاح`, result });
   } catch (err) {

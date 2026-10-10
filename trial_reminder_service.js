@@ -53,7 +53,7 @@ function formatPhoneToJid(phone) {
  * استخراج العمائر التي توشك فترتها التجريبية على الانتهاء
  * مرتبة تصاعدياً حسب الأقرب انتهاءً
  */
-async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null, excludeSent = true } = {}) {
+async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null, excludeSent = true, targetBuildingIds = null } = {}) {
   const { data: subs, error } = await supabase
     .from('building_subscriptions')
     .select('*, buildings(id, name, code, manager_name, manager_phone, is_active)')
@@ -75,6 +75,8 @@ async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null,
     }
   }
 
+  const targetIdsSet = targetBuildingIds ? new Set(targetBuildingIds.map(String)) : null;
+
   const now = new Date();
   const latestByBld = {};
 
@@ -89,6 +91,7 @@ async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null,
 
   for (const bId in latestByBld) {
     if (excludeSent && sentSet.has(String(bId))) continue;
+    if (targetIdsSet && !targetIdsSet.has(String(bId))) continue;
 
     const sub = latestByBld[bId];
     if (!sub.is_trial) continue; // تخطي المشتركين الفعليين
@@ -182,7 +185,8 @@ async function checkAndSendTrialReminders({
   logEvent = console.log,
   isManualTrigger = false,
   limit = 10,
-  targetPhoneOverride = null
+  targetPhoneOverride = null,
+  targetBuildingIds = null
 }) {
   if (!sock) {
     logEvent('تخطي تنبيهات التجارب', 'واتساب غير متصل حالياً', 'warning');
@@ -191,7 +195,11 @@ async function checkAndSendTrialReminders({
 
   logEvent('بدء فحص الاشتراكات التجريبية', `جاري البحث عن أقرب (${limit}) عمائر تقترب من انتهاء التجربة...`, 'info');
 
-  const expiringList = await getExpiringTrialBuildings(supabase, { limit, excludeSent: !targetPhoneOverride });
+  const expiringList = await getExpiringTrialBuildings(supabase, {
+    limit,
+    excludeSent: !targetPhoneOverride,
+    targetBuildingIds
+  });
   if (expiringList.length === 0) {
     logEvent('فحص التجارب', 'لا توجد عمائر تجريبية تقترب من الانتهاء حالياً', 'info');
     return { ok: true, sentCount: 0, list: [] };
