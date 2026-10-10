@@ -53,7 +53,7 @@ function formatPhoneToJid(phone) {
  * استخراج العمائر التي توشك فترتها التجريبية على الانتهاء
  * مرتبة تصاعدياً حسب الأقرب انتهاءً
  */
-async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null } = {}) {
+async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null, excludeSent = true } = {}) {
   const { data: subs, error } = await supabase
     .from('building_subscriptions')
     .select('*, buildings(id, name, code, manager_name, manager_phone, is_active)')
@@ -62,6 +62,17 @@ async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null 
   if (error || !subs) {
     console.error('[Trial Reminder] خطأ جلب الاشتراكات:', error?.message);
     return [];
+  }
+
+  const sentSet = new Set();
+  if (excludeSent) {
+    const { data: sentSettings } = await supabase
+      .from('building_settings')
+      .select('building_id')
+      .eq('key', 'trial_reminder_sent');
+    if (sentSettings) {
+      sentSettings.forEach(s => sentSet.add(String(s.building_id)));
+    }
   }
 
   const now = new Date();
@@ -77,22 +88,29 @@ async function getExpiringTrialBuildings(supabase, { limit = 10, maxDays = null 
   const expiringList = [];
 
   for (const bId in latestByBld) {
+    if (excludeSent && sentSet.has(String(bId))) continue;
+
     const sub = latestByBld[bId];
     if (!sub.is_trial) continue; // تخطي المشتركين الفعليين
 
     const bld = sub.buildings;
     if (!bld || !bld.manager_phone) continue;
 
+    // التأكد من صحة رقم الهاتف لإمكانية إرسال رسائل واتساب
+    const targetJid = formatPhoneToJid(bld.manager_phone);
+    if (!targetJid) continue;
+
     const expDate = new Date(sub.expiry_date);
     const diffDays = Math.ceil((expDate - now) / (1000 * 60 * 60 * 24));
 
     if (diffDays >= 1 && (maxDays ? diffDays <= maxDays : true)) {
       expiringList.push({
-        buildingId: bId,
+        buildingId: String(bId),
         buildingName: bld.name || 'بدون اسم',
         buildingCode: bld.code,
         managerName: bld.manager_name || 'مسؤول العمارة',
         managerPhone: bld.manager_phone,
+        targetJid,
         daysLeft: diffDays,
         expiryDate: expDate
       });
@@ -173,7 +191,7 @@ async function checkAndSendTrialReminders({
 
   logEvent('بدء فحص الاشتراكات التجريبية', `جاري البحث عن أقرب (${limit}) عمائر تقترب من انتهاء التجربة...`, 'info');
 
-  const expiringList = await getExpiringTrialBuildings(supabase, { limit });
+  const expiringList = await getExpiringTrialBuildings(supabase, { limit, excludeSent: !targetPhoneOverride });
   if (expiringList.length === 0) {
     logEvent('فحص التجارب', 'لا توجد عمائر تجريبية تقترب من الانتهاء حالياً', 'info');
     return { ok: true, sentCount: 0, list: [] };
@@ -449,6 +467,7 @@ async function handleTrialReminderResponse({ supabase, sock, senderJid, senderPh
 }
 
 module.exports = {
+  formatPhoneToJid,
   getExpiringTrialBuildings,
   checkAndSendTrialReminders,
   handleTrialReminderResponse,
