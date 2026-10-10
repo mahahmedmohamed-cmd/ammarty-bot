@@ -16,7 +16,7 @@ const { extractTextFromImage, parseReceiptData, matchReceiptWithCollision, norma
 const { generateInvoicePDF, formatDate, tafqeetEgyptianPounds } = require('./pdf_generator');
 const { getAIResponse } = require('./customer_service_ai');
 const { isAdminUser, handleAdminMessage } = require('./admin_service');
-const { handleTrialReminderResponse, checkAndSendTrialReminders } = require('./trial_reminder_service');
+const { handleTrialReminderResponse, checkAndSendTrialReminders, getExpiringTrialBuildings } = require('./trial_reminder_service');
 
 const app = express();
 app.use(express.json());
