@@ -319,13 +319,14 @@ async function initWhatsApp() {
 
         // ==================== 0. التحقق من مدير ومطور النظام (المهندس محمود أحمد) ====================
         if (isAdminUser(senderJid, senderPhone)) {
-          logEvent('مدير ومطور النظام (م. محمود)', { from: senderPhone, text: text.slice(0, 80), isImage }, 'success');
+          const effectiveAdminPhone = '01021252626';
+          logEvent('مدير ومطور النظام (م. محمود)', { from: effectiveAdminPhone, jid: senderJid, text: text.slice(0, 80), isImage }, 'success');
           try {
             await handleAdminMessage({
               sock,
               msg,
               senderJid,
-              senderPhone,
+              senderPhone: effectiveAdminPhone,
               text,
               isImage,
               supabase,
