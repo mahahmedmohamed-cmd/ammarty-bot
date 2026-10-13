@@ -7,6 +7,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
 let GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 if (!GEMINI_API_KEY) {
@@ -17,6 +18,17 @@ if (!GEMINI_API_KEY) {
       if (match) GEMINI_API_KEY = match[1].trim();
     }
   } catch (_) {}
+}
+
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://iowpdqulkujikzsjgebd.supabase.co';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlvd3BkcXVsa3VqaWt6c2pnZWJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1OTQ1NDYsImV4cCI6MjEwNDE3MDU0Nn0.26U1YKl_XFvTBu3r4jJJs5VrZr1vzr9DGrpgFsMTLEU';
+let defaultSupabase = null;
+function getSupabaseClient(customClient = null) {
+  if (customClient) return customClient;
+  if (!defaultSupabase) {
+    defaultSupabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }
+  return defaultSupabase;
 }
 
 // مسار مجلد لقطات الشاشة الحقيقية للتطبيق
@@ -131,18 +143,219 @@ const SCREENSHOT_DETAILS = {
 
 // الموديلات المرشحة بالترتيب لضمان التوفر الدائم وتفادي حدود الحصص
 const MODELS = [
+  'gemini-3.1-flash-lite',
   'gemini-3.8-flash',
   'gemini-3.5-flash',
-  'gemini-flash-latest',
-  'gemini-3.1-flash-lite'
+  'gemini-flash-latest'
 ];
 
 // ذاكرة المحادثة لكل عميل (آخر 6 رسائل للحفاظ على سياق الحوار)
 const chatSessions = new Map();
+function saveChatSession(phone, history) {
+  chatSessions.set(phone, history);
+  if (chatSessions.size > 100) {
+    const oldest = chatSessions.keys().next().value;
+    chatSessions.delete(oldest);
+  }
+}
 
 // ذاكرة عروض الصور المعلقة (في انتظار موافقة العميل)
 // مفتاح: senderPhone -> { filename, title, description, notes, timestamp }
 const pendingImageOffers = new Map();
+function savePendingImageOffer(phone, offer) {
+  pendingImageOffers.set(phone, offer);
+  if (pendingImageOffers.size > 50) {
+    const oldest = pendingImageOffers.keys().next().value;
+    pendingImageOffers.delete(oldest);
+  }
+}
+
+// ذاكرة مؤقتة لبيانات العملاء المسجلين (صلاحية 15 دقيقة لتسريع الردود وتخفيف الاستعلامات)
+const userProfileCache = new Map();
+function saveUserProfileCache(digits, data) {
+  userProfileCache.set(digits, data);
+  if (userProfileCache.size > 100) {
+    const oldest = userProfileCache.keys().next().value;
+    userProfileCache.delete(oldest);
+  }
+}
+
+/**
+ * البحث عن هوية العميل عبر رقم هاتفه في كافة العمارات (مدير، ساكن، مقدم خدمة)
+ */
+async function findUserProfileByPhone(senderPhone, client = null) {
+  if (!senderPhone) return null;
+  const digits = String(senderPhone).replace(/\D/g, '');
+  if (digits.length < 8) return null;
+
+  // فحص الكاش المؤقت
+  const cached = userProfileCache.get(digits);
+  if (cached && (Date.now() - cached.timestamp) < 15 * 60 * 1000) {
+    return cached.profile;
+  }
+
+  const supabase = getSupabaseClient(client);
+  const short8 = digits.slice(-8);
+
+  try {
+    // 1. البحث في مديري ومسؤولي العمارات (جدول buildings)
+    const { data: blds } = await supabase
+      .from('buildings')
+      .select('id, name, code, manager_name, manager_phone')
+      .ilike('manager_phone', `%${short8}%`)
+      .order('id', { ascending: false });
+
+    if (blds && blds.length > 0) {
+      const matched = blds.find(b => b.manager_name && b.manager_name.trim().length > 1) || blds[0];
+      if (matched && matched.manager_name && matched.manager_name.trim()) {
+        const profile = {
+          userType: 'manager',
+          name: matched.manager_name.trim(),
+          role: 'مسؤول العمارة',
+          buildingId: matched.id,
+          buildingName: matched.name || '',
+          buildingCode: matched.code || '',
+          phone: matched.manager_phone
+        };
+        saveUserProfileCache(digits, { profile, timestamp: Date.now() });
+        return profile;
+      }
+    }
+
+    // 2. البحث في جدول شقق وسكان العمارات (جدول apartments)
+    const { data: apts } = await supabase
+      .from('apartments')
+      .select('id, building_id, apt_number, owner_name, phone')
+      .ilike('phone', `%${short8}%`)
+      .order('id', { ascending: false });
+
+    if (apts && apts.length > 0) {
+      const matchedApt = apts.find(a => a.owner_name && a.owner_name.trim().length > 1) || apts[0];
+      if (matchedApt && matchedApt.owner_name && matchedApt.owner_name.trim()) {
+        let bldInfo = null;
+        if (matchedApt.building_id) {
+          const { data: bld } = await supabase
+            .from('buildings')
+            .select('id, name, code')
+            .eq('id', matchedApt.building_id)
+            .maybeSingle();
+          bldInfo = bld;
+        }
+        const profile = {
+          userType: 'resident',
+          name: matchedApt.owner_name.trim(),
+          role: matchedApt.apt_number ? `ساكن (شقة ${matchedApt.apt_number})` : 'ساكن بالعمارة',
+          aptNumber: matchedApt.apt_number,
+          buildingId: matchedApt.building_id,
+          buildingName: bldInfo ? (bldInfo.name || '') : '',
+          buildingCode: bldInfo ? (bldInfo.code || '') : '',
+          phone: matchedApt.phone
+        };
+        saveUserProfileCache(digits, { profile, timestamp: Date.now() });
+        return profile;
+      }
+    }
+
+    // 3. البحث في دليل الفنيين ومقدمي الخدمات (جدول service_providers)
+    const { data: sps } = await supabase
+      .from('service_providers')
+      .select('id, building_id, name, profession, phone')
+      .ilike('phone', `%${short8}%`)
+      .order('id', { ascending: false });
+
+    if (sps && sps.length > 0) {
+      const matchedSp = sps.find(s => s.name && s.name.trim().length > 1) || sps[0];
+      if (matchedSp && matchedSp.name && matchedSp.name.trim()) {
+        let bldInfo = null;
+        if (matchedSp.building_id) {
+          const { data: bld } = await supabase
+            .from('buildings')
+            .select('id, name, code')
+            .eq('id', matchedSp.building_id)
+            .maybeSingle();
+          bldInfo = bld;
+        }
+        const profile = {
+          userType: 'provider',
+          name: matchedSp.name.trim(),
+          role: `مقدم خدمة (${matchedSp.profession || 'فني'})`,
+          buildingId: matchedSp.building_id,
+          buildingName: bldInfo ? (bldInfo.name || '') : '',
+          buildingCode: bldInfo ? (bldInfo.code || '') : '',
+          phone: matchedSp.phone
+        };
+        saveUserProfileCache(digits, { profile, timestamp: Date.now() });
+        return profile;
+      }
+    }
+  } catch (err) {
+    console.warn('[findUserProfileByPhone] Error looking up user profile:', err.message);
+  }
+
+  saveUserProfileCache(digits, { profile: null, timestamp: Date.now() });
+  return null;
+}
+
+/**
+ * تنسيق لقب واسم العميل للترحيب اللائق والمحترم
+ */
+function formatSalutation(name, userType = 'manager', buildingName = '') {
+  if (!name || !name.trim()) return '';
+  const cleanName = name.trim().replace(/[\/\\_-]/g, ' ').replace(/\s+/g, ' ');
+
+  // التحقق هل الاسم يحتوي على لقب مسبق
+  const hasTitle = /^(?:م\.|مهندس|د\.|دكتور|دكتورة|أستاذ|أستاذة|أ\.|الحاج|الحاجة|الشيخ|كابتن)\b/i.test(cleanName);
+  const title = hasTitle ? '' : 'أستاذ ';
+
+  let roleSuffix = '';
+  if (userType === 'manager' && buildingName) {
+    roleSuffix = ` (مسؤول عمارة ${buildingName})`;
+  } else if (userType === 'resident' && buildingName) {
+    roleSuffix = ` (عمارة ${buildingName})`;
+  }
+
+  return `${title}${cleanName}${roleSuffix}`;
+}
+
+/**
+ * التأكد من وجود اسم العميل وترحيب مخصص في أول رسالة بالمحادثة
+ */
+function ensurePersonalizedGreeting(replyText, userProfile, isFirstMessage) {
+  if (!replyText || !userProfile || !userProfile.name || !isFirstMessage) {
+    return replyText;
+  }
+
+  const name = userProfile.name.trim();
+  // إذا كان الرد يحتوي بالفعل على اسم العميل، فلا داعي للتعديل
+  if (replyText.includes(name)) {
+    return replyText;
+  }
+
+  const salutation = formatSalutation(name, userProfile.userType, userProfile.buildingName);
+
+  // إذا كان الرد يبدأ بـ "وعليكم السلام"
+  if (/^وعليكم\s*السلام/i.test(replyText)) {
+    return replyText.replace(/^(وعليكم\s*السلام(?:\s*ورحمة\s*الله(?:\s*وبركاته)?)?)[!،,\.]*(?:\s*أهلاً\s*(?:بك|بحضرتك)?)?/i, `$1 أهلاً بك ${salutation} 🏢✨`);
+  }
+
+  // إذا كان الرد يبدأ بـ "أهلاً بك"
+  if (/^أهلاً\s*(?:بك|بحضرتك|بيك)?(?:\s*يا\s*فندم)?[!،,\.]*/i.test(replyText)) {
+    return replyText.replace(/^أهلاً\s*(?:بك|بحضرتك|بيك)?(?:\s*يا\s*فندم)?[!،,\.]*/i, `أهلاً بك ${salutation} 🏢✨\n`);
+  }
+
+  // إذا كان الرد يبدأ بـ "صباح/مساء الخير"
+  if (/^(?:صباح|مساء)\s*الخير(?:\s*يا\s*فندم)?[!،,\.]*/i.test(replyText)) {
+    return replyText.replace(/^((?:صباح|مساء)\s*الخير)(?:\s*يا\s*فندم)?[!،,\.]*/i, `$1 ${salutation} 🏢✨\n`);
+  }
+
+  // إذا كان الرد يبدأ بـ "مرحباً"
+  if (/^مرحباً\s*(?:بك|بحضرتك)?[!،,\.]*/i.test(replyText)) {
+    return replyText.replace(/^مرحباً\s*(?:بك|بحضرتك)?[!،,\.]*/i, `مرحباً بك ${salutation} 🏢✨\n`);
+  }
+
+  // إذا لم يكن هناك ترحيب صريح في البداية وكان رد مباشر على سؤال في أول رسالة
+  return `أهلاً بك ${salutation} 🏢✨\n\n${replyText}`;
+}
 
 /**
  * جلب بافر الصورة محلياً أو سحابياً من GitHub Raw كاحتياط أخير
@@ -374,7 +587,7 @@ async function parseReplyForImage(replyText, senderPhone) {
 
     // حفظ العرض المعلق للمستخدم
     if (senderPhone) {
-      pendingImageOffers.set(senderPhone, {
+      savePendingImageOffer(senderPhone, {
         filename: rawFilename,
         title: details.title,
         description: details.description,
@@ -425,7 +638,7 @@ async function parseReplyForImage(replyText, senderPhone) {
 /**
  * إرسال الرسالة إلى Gemini واسترجاع الرد الذكي مع لقطة الشاشة التوضيحية
  */
-async function getAIResponse(senderPhone, userMessage) {
+async function getAIResponse(senderPhone, userMessage, options = {}) {
   if (!userMessage || !userMessage.trim()) return null;
 
   // إذا كان المرسل هو مدير ومطور النظام (م. محمود أحمد)
@@ -434,6 +647,10 @@ async function getAIResponse(senderPhone, userMessage) {
     const adminText = await getAdminAIResponse(userMessage);
     return { text: adminText, imageBuffer: null, sendImage: false };
   }
+
+  // البحث عن هوية العميل عبر رقم هاتفه في كافة العمارات
+  const supabaseClient = options.supabase || null;
+  const userProfile = options.userProfile || (await findUserProfileByPhone(senderPhone, supabaseClient));
 
   // جلب سياق المحادثة السابق
   let history = chatSessions.get(senderPhone) || [];
@@ -445,6 +662,7 @@ async function getAIResponse(senderPhone, userMessage) {
   }
 
   const isOngoingConversation = history.length > 0;
+  const isFirstMessage = !isOngoingConversation;
 
   // ---------- 1. التحقق من العروض المعلقة للصور (إذا كان العميل يرد على سؤال عرض الصورة) ----------
   const activeOffer = pendingImageOffers.get(senderPhone);
@@ -461,7 +679,7 @@ async function getAIResponse(senderPhone, userMessage) {
         history.push({ role: 'user', text: userMessage });
         history.push({ role: 'model', text: `تم إرسال لقطة شاشة توضيحية لـ ${activeOffer.title}` });
         history.lastActive = Date.now();
-        chatSessions.set(senderPhone, history);
+        saveChatSession(senderPhone, history);
 
         return {
           text: caption,
@@ -475,12 +693,13 @@ async function getAIResponse(senderPhone, userMessage) {
     // ب) إذا رد العميل بالرفض (لا، شكراً، مش محتاج...)
     if (isNegativeResponse(userMessage)) {
       pendingImageOffers.delete(senderPhone);
-      const declineReply = 'تحت أمرك يا فندم! لو احتجت أي استفسار أو مساعدة أنا في خدمتك دائماً 🌸';
+      const declineSalutation = userProfile?.name ? `أستاذ ${userProfile.name}` : 'يا فندم';
+      const declineReply = `تحت أمرك ${declineSalutation}! لو احتجت أي استفسار أو مساعدة أنا في خدمتك دائماً 🌸`;
 
       history.push({ role: 'user', text: userMessage });
       history.push({ role: 'model', text: declineReply });
       history.lastActive = Date.now();
-      chatSessions.set(senderPhone, history);
+      saveChatSession(senderPhone, history);
 
       return {
         text: declineReply,
@@ -493,7 +712,7 @@ async function getAIResponse(senderPhone, userMessage) {
     pendingImageOffers.delete(senderPhone);
   }
 
-  // ---------- 2. تجهيز محادثة نظيفة وتمريرها لـ Gemini ----------
+  // ---------- 2. تجهيز محادثة نظيفة وتمريرها لـ Gemini مع سياق هوية العميل ----------
   const contents = [];
 
   // إضافة سياق المحادثة السابقة
@@ -510,24 +729,49 @@ async function getAIResponse(senderPhone, userMessage) {
     parts: [{ text: userMessage }]
   });
 
+  // صياغة سياق وهوية العميل لدعم الترحيب بالاسم والوعي الكامل ببياناته
+  let userContextPrompt = '';
+  if (userProfile && userProfile.name) {
+    const roleDesc = userProfile.userType === 'manager'
+      ? `مسؤول عمارة (${userProfile.buildingName || ''} - كود: ${userProfile.buildingCode || ''})`
+      : (userProfile.userType === 'resident'
+        ? `أحد سكان عمارة (${userProfile.buildingName || ''}) - ${userProfile.role}`
+        : `مقدم خدمة (${userProfile.role}) لعمارة ${userProfile.buildingName || ''}`);
+
+    userContextPrompt = `\n\nمعلومات العميل المتحدث معك حالياً:
+• الاسم المسجل في النظام: ${userProfile.name}
+• الصفة: ${roleDesc}
+• رقم الهاتف: ${senderPhone}
+
+قواعد الترحيب والمخاطبة بالاسم لهذا العميل:
+1. هذا العميل مسجل رسمياً في نظام عمارتي باسم "${userProfile.name}".
+2. ${isFirstMessage ? `**هذه هي الرسالة الأولى في المحادثة**: يجب أن تبدأ ردك بترحيب شخصي حار ولائق باسمه (مثال: "أهلاً بك أستاذ ${userProfile.name} 🏢✨" أو "وعليكم السلام أستاذ ${userProfile.name} 🏢✨").` : 'هذه محادثة جارية مسبقاً: لا تعد تكرار ديباجة الترحيب الافتتاحية في كل رد، بل ادخل في صلب الإجابة مباشرة مع إمكانية مخاطبته باسمه بلباقة عند الحاجة.'}
+3. يمكنك الإشارة لعمارتهم أو شقتهم عند الاقتضاء لإشعاره بالاهتمام والاحترافية.`;
+  }
+
+  const effectiveSystemPrompt = SYSTEM_PROMPT + userContextPrompt;
+
   // محاولة الإرسال مع تدوير الموديلات عند الضرورة
   for (const model of MODELS) {
     try {
-      const reply = await callGeminiAPI(model, SYSTEM_PROMPT, contents);
+      const reply = await callGeminiAPI(model, effectiveSystemPrompt, contents);
       if (reply) {
         const parsed = await parseReplyForImage(reply, senderPhone);
 
-        // إذا كانت المحادثة مستمرة، نزيل برمجياً أي تحية افتتاحية مكررة في بداية الرد لضمان الدخول المباشر في الإجابة
+        // إذا كانت المحادثة مستمرة، نزيل برمجياً أي تحية افتتاحية مكررة لضمان الدخول المباشر في الإجابة
         if (isOngoingConversation && parsed.text && !parsed.sendImage) {
           const repetitiveGreetingRegex = /^(?:(?:يا\s*)?هلا\s*(?:ب(?:ك|حضرتك))?(?:\s*يا\s*فندم)?[!،,\.]*|أهلاً\s*(?:بك|بحضرتك|بيك)?(?:\s*يا\s*فندم)?[!،,\.]*|مساء\s*(?:الخير|النور|الجمال|الفل)(?:\s*يا\s*فندم)?[!،,\.]*|صباح\s*(?:الخير|النور|الجمال|الفل)(?:\s*يا\s*فندم)?[!،,\.]*|تحت\s*أمرك(?:\s*يا\s*فندم)?[!،,\.]*|نورتنا(?:\s*يا\s*فندم)?[!،,\.]*)\s*/i;
           parsed.text = parsed.text.replace(repetitiveGreetingRegex, '').trim();
+        } else if (isFirstMessage && parsed.text && !parsed.sendImage) {
+          // في الرسالة الأولى: التأكد الحاسم من إدراج اسم العميل في الترحيب
+          parsed.text = ensurePersonalizedGreeting(parsed.text, userProfile, true);
         }
 
         // حفظ الرسالة والرد في الذاكرة
         history.push({ role: 'user', text: userMessage });
         history.push({ role: 'model', text: parsed.text });
         history.lastActive = Date.now();
-        chatSessions.set(senderPhone, history);
+        saveChatSession(senderPhone, history);
 
         return parsed;
       }
@@ -536,9 +780,13 @@ async function getAIResponse(senderPhone, userMessage) {
     }
   }
 
-  // إذا حدث ضغط استثنائي على السيرفرات، نرجع رداً احتياطياً لائقاً ومختصراً
+  // إذا حدث ضغط استثنائي على السيرفرات، نرجع رداً احتياطياً لائقاً ومختصراً ومرحباً بالاسم
+  const welcomeSalutation = userProfile?.name
+    ? `أهلاً بك ${formatSalutation(userProfile.name, userProfile.userType, userProfile.buildingName)} 🏢✨ في خدمة عملاء تطبيق عمارتي`
+    : 'أهلاً بك يا فندم في خدمة عملاء تطبيق عمارتي 🏢';
+
   return {
-    text: `أهلاً بك يا فندم في خدمة عملاء تطبيق عمارتي 🏢\nيسعدنا مساعدتك في أي استفسار يخص إدارة عقارك واشتراكات الشقق والمصروفات.\n\n💡 يمكنك السؤال عن:\n• مميزات التطبيق وكيفية استخدامه 📋\n• باقات الاشتراك وطرق الدفع (فودافون كاش / إنستاباي) 💳\n• حلول مشاكل تسجيل الدخول واستعادة كلمة المرور 🔒\n\nكيف يمكننا خدمتك؟`,
+    text: `${welcomeSalutation}\nيسعدنا مساعدتك في أي استفسار يخص إدارة عقارك واشتراكات الشقق والمصروفات.\n\n💡 يمكنك السؤال عن:\n• مميزات التطبيق وكيفية استخدامه 📋\n• باقات الاشتراك وطرق الدفع (فودافون كاش / إنستاباي) 💳\n• حلول مشاكل تسجيل الدخول واستعادة كلمة المرور 🔒\n\nكيف يمكننا خدمتك اليوم؟`,
     imageBuffer: null,
     sendImage: false
   };
@@ -597,6 +845,9 @@ function callGeminiAPI(model, systemPrompt, contents) {
 
 module.exports = {
   getAIResponse,
+  findUserProfileByPhone,
+  formatSalutation,
+  ensurePersonalizedGreeting,
   parseReplyForImage,
   getImageBuffer,
   isAffirmativeResponse,

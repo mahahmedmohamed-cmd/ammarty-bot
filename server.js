@@ -14,7 +14,7 @@ const path = require('path');
 const { generateInvoiceHTML } = require('./invoice_template');
 const { extractTextFromImage, parseReceiptData, matchReceiptWithCollision, normalizeDigits } = require('./receipt_scanner');
 const { generateInvoicePDF, formatDate, tafqeetEgyptianPounds } = require('./pdf_generator');
-const { getAIResponse } = require('./customer_service_ai');
+const { getAIResponse, findUserProfileByPhone } = require('./customer_service_ai');
 const { isAdminUser, handleAdminMessage } = require('./admin_service');
 const { handleTrialReminderResponse, checkAndSendTrialReminders, getExpiringTrialBuildings } = require('./trial_reminder_service');
 
@@ -160,7 +160,28 @@ function parseRenewalWhatsAppMessage(text) {
 
 // ==================== حفظ واستعادة جلسة واتساب سحابياً في Supabase ====================
 
-async function backupAuthStateToSupabase() {
+let lastBackupTimestamp = 0;
+let backupDebounceTimer = null;
+
+async function backupAuthStateToSupabase(force = false) {
+  const now = Date.now();
+  // حماية صارمة للباندويث والذاكرة: يتم الحفظ على السحابة كل 30 دقيقة كحد أقصى إلا في حالات الإغلاق الإجباري
+  if (!force && (now - lastBackupTimestamp < 30 * 60 * 1000)) {
+    if (!backupDebounceTimer) {
+      backupDebounceTimer = setTimeout(() => {
+        backupDebounceTimer = null;
+        backupAuthStateToSupabase(true);
+      }, 30 * 60 * 1000);
+    }
+    return;
+  }
+
+  if (backupDebounceTimer) {
+    clearTimeout(backupDebounceTimer);
+    backupDebounceTimer = null;
+  }
+  lastBackupTimestamp = now;
+
   try {
     if (!fs.existsSync(AUTH_DIR)) return;
     const files = fs.readdirSync(AUTH_DIR);
@@ -178,6 +199,7 @@ async function backupAuthStateToSupabase() {
       value: JSON.stringify(bundle),
       updated_at: new Date().toISOString()
     });
+    logEvent('مزامنة سحابية للجلسة', 'تم حفظ الجلسة بنجاح مع ترشيد استهلاك الباندويث', 'info');
   } catch (err) {
     console.error('[Auth Sync] فشل حفظ الجلسة في سوبابايز:', err.message);
   }
@@ -214,7 +236,13 @@ async function initWhatsApp() {
     const msgRetryCounterCache = new Map();
     const retryCache = {
       get: (k) => msgRetryCounterCache.get(k),
-      set: (k, v) => msgRetryCounterCache.set(k, v),
+      set: (k, v) => {
+        msgRetryCounterCache.set(k, v);
+        if (msgRetryCounterCache.size > 100) {
+          const oldest = msgRetryCounterCache.keys().next().value;
+          msgRetryCounterCache.delete(oldest);
+        }
+      },
       del: (k) => msgRetryCounterCache.delete(k),
     };
     const messageStore = new Map();
@@ -278,13 +306,13 @@ async function initWhatsApp() {
         if (msg.key?.id) {
           if (processedMsgIds.has(msg.key.id)) continue;
           processedMsgIds.add(msg.key.id);
-          if (processedMsgIds.size > 2000) {
+          if (processedMsgIds.size > 200) {
             const oldest = processedMsgIds.values().next().value;
             processedMsgIds.delete(oldest);
           }
           if (msg.message) {
             messageStore.set(msg.key.id, msg.message);
-            if (messageStore.size > 2000) {
+            if (messageStore.size > 200) {
               const oldKey = messageStore.keys().next().value;
               messageStore.delete(oldKey);
             }
@@ -1180,10 +1208,10 @@ async function initWhatsApp() {
         }
 
         // ---------- 4. خدمة العملاء والرد الذكي بالذكاء الاصطناعي (Gemini) ----------
-        if (text && text.trim().length > 1) {
+        if (text && text.trim().length >= 1) {
           try {
             logEvent('طلب مساعدة ذكي عبر الذكاء الاصطناعي', { from: senderPhone, text: text.slice(0, 60) });
-            const aiReply = await getAIResponse(senderPhone, text);
+            const aiReply = await getAIResponse(senderPhone, text, { supabase });
             if (aiReply) {
               const replyText = typeof aiReply === 'object' ? aiReply.text : aiReply;
               const hasImage = typeof aiReply === 'object' && aiReply.sendImage;
@@ -1399,12 +1427,12 @@ async function pollOutbox() {
     // تجاهل أخطاء الاتصال الدورية
   } finally {
     isOutboxPolling = false;
-    setTimeout(pollOutbox, 4000);
+    setTimeout(pollOutbox, 8000);
   }
 }
 
 // بدء المراقب المتسلسل الآمن
-setTimeout(pollOutbox, 4000);
+setTimeout(pollOutbox, 8000);
 
 // ==================== محرك تحليل وتفعيل الدفع التلقائي ====================
 

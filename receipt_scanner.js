@@ -26,14 +26,23 @@ function normalizeDigits(str) {
  * فحص الصورة واستخراج النصوص عبر OCR
  */
 async function extractTextFromImage(imageBuffer) {
+  let worker = null;
   try {
-    const { data } = await Tesseract.recognize(imageBuffer, 'ara+eng', {
-      langPath: __dirname
+    worker = await Tesseract.createWorker(['ara', 'eng'], 1, {
+      langPath: __dirname,
+      cachePath: __dirname
     });
+    const { data } = await worker.recognize(imageBuffer);
     return data.text || '';
   } catch (err) {
     console.error('[OCR Error]:', err.message);
     throw err;
+  } finally {
+    if (worker) {
+      try {
+        await worker.terminate();
+      } catch (_) {}
+    }
   }
 }
 
