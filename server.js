@@ -5,7 +5,7 @@
  */
 
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, generateMessageID } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const QRCode = require('qrcode');
 const pino = require('pino');
@@ -15,8 +15,20 @@ const { generateInvoiceHTML } = require('./invoice_template');
 const { extractTextFromImage, parseReceiptData, matchReceiptWithCollision, normalizeDigits } = require('./receipt_scanner');
 const { generateInvoicePDF, formatDate, tafqeetEgyptianPounds } = require('./pdf_generator');
 const { getAIResponse, findUserProfileByPhone } = require('./customer_service_ai');
-const { isAdminUser, handleAdminMessage } = require('./admin_service');
+const { isAdminUser, handleAdminMessage, activateCapitalGardensBuilding } = require('./admin_service');
 const { handleTrialReminderResponse, checkAndSendTrialReminders, getExpiringTrialBuildings } = require('./trial_reminder_service');
+const {
+  wrapSocketSendMessage,
+  isBotSentMessage,
+  setHumanMode,
+  clearHumanMode,
+  isHumanModeActive,
+  getHumanModeDetails,
+  getAllActiveTakeovers,
+  isRequestingHumanAgent,
+  handleAdminOutgoingMessage,
+  CUSTOMER_REQUEST_MS
+} = require('./human_takeover_service');
 
 const app = express();
 app.use(express.json());
@@ -257,6 +269,9 @@ async function initWhatsApp() {
       }
     });
 
+    // تغليف دالة الإرسال لتسجيل معرفات رسائل البوت تلقائياً والتمييز الدقيق بين ردود البوت وتدخل الأدمن
+    wrapSocketSendMessage(sock, { generateMessageID });
+
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -299,8 +314,33 @@ async function initWhatsApp() {
       for (const msg of messages) {
         if (!msg.message || msg.key.remoteJid.includes('@g.us')) continue;
 
-        // تجاهل أي رسالة صادرة من البوت نهائياً لمنع أي حلقة تكرار لانهائية
-        if (msg.key.fromMe) continue;
+        // معالجة الرسائل الصادرة (fromMe = true)
+        if (msg.key.fromMe) {
+          const msgId = msg.key?.id;
+          // إذا كانت الرسالة صادرة من كود وسيرفر البوت نفسه -> نتجاهلها تماماً
+          if (msgId && isBotSentMessage(msgId)) {
+            continue;
+          }
+
+          // إذا لم تكن من كود البوت، فهذا يعني أن المهندس محمود أحمد يتحدث بنفسه من الهاتف أو واتساب ويب!
+          const targetJid = msg.key.remoteJid;
+          const text =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            msg.message?.videoMessage?.caption ||
+            msg.message?.documentMessage?.caption ||
+            '';
+
+          await handleAdminOutgoingMessage({
+            targetJid,
+            text,
+            msg,
+            sock,
+            logEvent
+          });
+          continue;
+        }
 
         // منع تكرار معالجة الرسائل ذات نفس المعرف (ID deduplication)
         if (msg.key?.id) {
@@ -453,12 +493,13 @@ async function initWhatsApp() {
         if (isImage || isProofText) {
           try {
             let ocrText = '';
+            let imageBuffer = null;
             if (isImage) {
               try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                if (buffer) {
+                imageBuffer = await downloadMediaMessage(msg, 'buffer', {});
+                if (imageBuffer) {
                   logEvent('بدء تحليل OCR للصورة الواردة', senderPhone);
-                  ocrText = await extractTextFromImage(buffer);
+                  ocrText = await extractTextFromImage(imageBuffer);
                   logEvent('نتائج استخراج النصوص OCR', ocrText.slice(0, 150));
                 }
               } catch (ocrErr) {
@@ -826,7 +867,126 @@ async function initWhatsApp() {
               continue;
             }
 
-            // إذا لم تكن سكرين شوت تقييم، فهي إيصال تحويل مالي
+            // فحص هل الصورة أو الرسالة هي إثبات سكن لمبادرة أهالي حدائق العاصمة (#هنطور_مدينتنا)
+            const isCapitalGardensProof = /(?:حدائق\s*العاصمة|العاصمة|هنطور_مدينتنا|مبادرة|بدر|سكن\s*لكل\s*المصريين|إسكان\s*اجتماعي|محضر\s*استلام|تخصيص|وصل\s*(?:كهرباء|مياه|غاز)|فاتورة\s*(?:كهرباء|مياه|غاز))/i.test(combinedContent);
+
+            if (isCapitalGardensProof && !hasPaymentMarkers) {
+              logEvent('تم رصد إثبات مبادرة حدائق العاصمة', senderPhone, 'info');
+
+              const cleanPhone = senderPhone.replace(/^20/, '0');
+              const short9 = cleanPhone.slice(-9);
+
+              // البحث عن عمارة العميل
+              const { data: bldCandidates } = await supabase
+                .from('buildings')
+                .select('*, building_subscriptions(*)')
+                .or(`manager_phone.eq.${senderPhone},manager_phone.eq.${cleanPhone},manager_phone.eq.+20${cleanPhone.slice(1)}`)
+                .order('id', { ascending: false });
+
+              let matchedBld = bldCandidates && bldCandidates.length > 0 ? bldCandidates[0] : null;
+
+              if (!matchedBld) {
+                const { data: aptCandidates } = await supabase
+                  .from('apartments')
+                  .select('building_id, apt_number, owner_name, phone')
+                  .ilike('phone', `%${short9}%`)
+                  .limit(1);
+
+                if (aptCandidates && aptCandidates.length > 0) {
+                  const { data: aptBld } = await supabase
+                    .from('buildings')
+                    .select('*, building_subscriptions(*)')
+                    .eq('id', aptCandidates[0].building_id)
+                    .maybeSingle();
+                  if (aptBld) matchedBld = aptBld;
+                }
+              }
+
+              if (!matchedBld && (text || ocrText)) {
+                const codeSearch = (text + ' ' + ocrText);
+                const codeMatch = codeSearch.match(/BLD-?[0-9]{4}/i) || codeSearch.match(/[0-9]{4}/);
+                if (codeMatch) {
+                  const digits = codeMatch[0].match(/[0-9]{4}/);
+                  if (digits) {
+                    const codeStr = 'BLD-' + digits[0];
+                    const { data: codeBld } = await supabase
+                      .from('buildings')
+                      .select('*, building_subscriptions(*)')
+                      .eq('code', codeStr)
+                      .maybeSingle();
+                    if (codeBld) matchedBld = codeBld;
+                  }
+                }
+              }
+
+              if (!matchedBld) {
+                const missingCodeMsg =
+                  `🏢✨ *أهلاً بحضرتك وبكل جيراننا الكرام في «حدائق العاصمة»!* 🌟\n\n` +
+                  `تم استلام صورة الإثبات بنجاح 📸\n\n` +
+                  `لتفعيل اشتراك السنة المجاني 100% لعمارتكم فوراً ضمن مبادرة *#هنطور_مدينتنا*، يرجى كتابة *كود العمارة المسجل في التطبيق* (مثال: *BLD-1234*) لربط الاشتراك بعمارتكم واعتماده فورياً! 🏢🚀`;
+                await sock.sendMessage(senderJid, { text: missingCodeMsg });
+                logEvent('إثبات حدائق العاصمة بدون كود عمارة', senderPhone, 'info');
+                continue;
+              }
+
+              // التحقق هل استفادت العمارة مسبقاً
+              const { data: initRow } = await supabase
+                .from('building_settings')
+                .select('value')
+                .eq('building_id', matchedBld.id)
+                .eq('key', 'capital_gardens_initiative')
+                .maybeSingle();
+
+              if (initRow && initRow.value) {
+                let initData = {};
+                try { initData = JSON.parse(initRow.value); } catch (_) {}
+                if (initData.status === 'active') {
+                  const alreadyMsg =
+                    `🎉 *أهلاً بحضرتك وبجيراننا الكرام في حدائق العاصمة!* 🏢✨\n\n` +
+                    `عمارة (*${matchedBld.name}* - كود: *${matchedBld.code}*) قد استفادت بالفعل مسبقاً من مبادرة حدائق العاصمة (#هنطور_مدينتنا) واشتراكها السنوي المجاني نشط في النظام حتى *${initData.expiry_date ? formatDate(new Date(initData.expiry_date)) : 'تاريخ الانتهاء'}*.\n\n` +
+                    `نسعد دائماً بخدمتكم وتواجدكم معنا 🌸`;
+                  await sock.sendMessage(senderJid, { text: alreadyMsg });
+                  logEvent('العمارة استفادت بالفعل من مبادرة حدائق العاصمة', matchedBld.code, 'info');
+                  continue;
+                }
+              }
+
+              // إرسال رسالة استلام وتأكيد للعميل
+              const receiptMsg =
+                `🏢✨ *أهلاً بحضرتك وبكل جيراننا الأعزاء في مدينة «حدائق العاصمة»!* 🌟\n\n` +
+                `تم استلام إثبات السكن لعمارتكم الموقرة (*${matchedBld.name}* - كود: *${matchedBld.code}*) بنجاح 📸✅\n\n` +
+                `⏳ جاري الآن مراجعة الإثبات وتفعيل الاشتراك السنوي المجاني (365 يوماً هدية) لعمارتكم فوراً ضمن مبادرة:\n` +
+                `🌟 *#هنطور_مدينتنا* 🌟\n\n` +
+                `ستصلكم رسالة التأكيد والترخيص المعتمدة هنا فور الاعتماد بإذن الله 🚀`;
+              await sock.sendMessage(senderJid, { text: receiptMsg });
+
+              // إرسال إشعار فوري لمدير النظام (م. محمود أحمد) مع صورة الإثبات وزر التفعيل بنقرة واحدة
+              try {
+                const adminJid = '201021252626@s.whatsapp.net';
+                const adminAlert =
+                  `🚨 *طلب تفعيل مبادرة حدائق العاصمة (#هنطور_مدينتنا)* 🏢✨\n\n` +
+                  `• *العمارة:* ${matchedBld.name} (كود: *${matchedBld.code}*)\n` +
+                  `• *المرسل:* ${matchedBld.manager_name || 'الساكن'} (${senderPhone})\n` +
+                  (ocrText ? `• *النص المستخرج (OCR):* ${ocrText.slice(0, 120)}\n\n` : '\n') +
+                  `👉 *للتفعيل الفوري بضغطة واحدة، ارسل:* \n` +
+                  `*تفعيل حدائق ${matchedBld.code}*`;
+
+                if (imageBuffer) {
+                  await sock.sendMessage(adminJid, {
+                    image: imageBuffer,
+                    caption: adminAlert
+                  });
+                } else {
+                  await sock.sendMessage(adminJid, { text: adminAlert });
+                }
+                logEvent('تم إرسال إشعار طلب مبادرة حدائق العاصمة للمهندس محمود', matchedBld.code, 'success');
+              } catch (adminErr) {
+                logEvent('خطأ إرسال إشعار المبادرة للمهندس محمود', adminErr.message, 'warning');
+              }
+              continue;
+            }
+
+            // إذا لم تكن سكرين شوت تقييم ولا إثبات مبادرة، فهي إيصال تحويل مالي
             if (isImage) {
               await sock.sendMessage(senderJid, {
                 text: `⏳ تم استلام صورة الإيصال بنجاح وجاري التأكد من معلومات الدفع بالحساب`
@@ -1189,6 +1349,40 @@ async function initWhatsApp() {
           } catch (err) {
             logEvent('خطأ كود كلمة المرور', err.message, 'error');
           }
+          continue;
+        }
+
+        // ==================== 3.4 فحص وضع التحدث البشري (Human Takeover) ====================
+        if (isHumanModeActive(senderJid, senderPhone)) {
+          logEvent('محادثة بشرية جارية', {
+            from: senderPhone,
+            reason: 'تم حجب الرد التلقائي لإفساح المجال للمهندس محمود للمتابعة مع العميل بحرية'
+          }, 'info');
+          continue;
+        }
+
+        // فحص هل العميل يطلب صراحة التحدث مع شخص بشري/خدمة العملاء
+        if (isRequestingHumanAgent(text)) {
+          setHumanMode(senderJid, senderPhone, CUSTOMER_REQUEST_MS, 'طلب العميل التحدث مع شخص بشري');
+          logEvent('طلب تدخل بشري من العميل', { from: senderPhone, text: text.slice(0, 80) }, 'warning');
+
+          const humanReply =
+            `أهلاً بحضرتك يا فندم 👨‍💼✨\n\n` +
+            `تم تحويل محادثتك فوراً للمهندس محمود أحمد (مؤسس ومسؤول منصة عمارتي) وسيقوم بالرد على استفسارك ومتابعة طلبك بنفسه مباشرة.\n\n` +
+            `سيتم الرد عليك في أقرب وقت بمجرد فتح الشات 🌸`;
+
+          await sock.sendMessage(senderJid, { text: humanReply });
+
+          try {
+            const adminAlertJid = '201021252626@s.whatsapp.net';
+            const adminNotify =
+              `🔔 *طلب دعم بشري من عميل*\n\n` +
+              `• *رقم هاتف العميل:* ${senderPhone}\n` +
+              `• *نص الرسالة:* "${text}"\n\n` +
+              `💡 *ملاحظة:* تم إيقاف ردود البوت التلقائية مع هذا الشات لمدة 4 ساعات لتتمكن من التحدث معه بحرية تامة دون أي مقاطعة.`;
+            await sock.sendMessage(adminAlertJid, { text: adminNotify });
+          } catch (_) {}
+
           continue;
         }
 

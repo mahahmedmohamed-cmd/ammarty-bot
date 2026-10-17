@@ -19,6 +19,12 @@ const fs = require('fs');
 const path = require('path');
 const { generateInvoicePDF, formatDate } = require('./pdf_generator');
 const { extractTextFromImage, parseReceiptData, normalizeDigits } = require('./receipt_scanner');
+const {
+  getAllActiveTakeovers,
+  clearHumanMode,
+  setHumanMode,
+  EXTENDED_TAKEOVER_MS
+} = require('./human_takeover_service');
 
 const ADMIN_PHONE = '01021252626';
 
@@ -68,7 +74,9 @@ const ADMIN_AI_SYSTEM_PROMPT = `
      2️⃣ *لا، شكراً*"
    - نص رسالة الأسعار وهدية التقييم (عند رد العميل بـ 1 أو نعم):
      باقات الاشتراك (سنة: 200 ج.م، سنتان: 360 ج.م، 3 سنوات: 480 ج.م، 5 سنوات: 700 ج.م) + هدية شهرين إضافيين مجاناً (60 يوماً) زيادة فوق مدة الاشتراك المدفوع عند كتابة 3 تقييمات إيجابية على متجر Google Play + بيانات التحويل (إنستاباي وفودافون كاش: 01021252626).
-5. يمكنك دائماً تذكيره في ختام إجاباتك بأنه يمكنه إرسال أوامر التحكم السريعة في أي وقت:
+5. مبادرة حدائق العاصمة الحصرية (تفعيل سنة مجاناً 100%):
+   - الباشمهندس محمود أطلق مبادرة مجانية بالكامل لأهالي وجيران حدائق العاصمة: اشتراك سنة مجاناً لكل عمارة تثبت أنها بحدائق العاصمة وترسل كود العمارة، مع طلب تقييم 5 نجوم على Google Play كدعم للمشروع.
+6. يمكنك دائماً تذكيره في ختام إجاباتك بأنه يمكنه إرسال أوامر التحكم السريعة في أي وقت:
    (احصائيات | معلق | تجارب | اختبار التجارب | ارسال التجارب 10 | بحث [كود] | تفعيل [كود] [سنة] | سيرفر).
 `;
 
@@ -581,6 +589,159 @@ async function adminActivateBuilding({ supabase, sock, buildingCode, durationStr
 }
 
 /**
+ * 4.ب. تفعيل اشتراك سنوي مجاني 100% لمبادرة أهالي حدائق العاصمة (#هنطور_مدينتنا)
+ */
+async function activateCapitalGardensBuilding({ supabase, sock, buildingCode, clientPhone = null, clientJid = null }) {
+  if (!buildingCode) {
+    return { ok: false, message: 'يرجى تحديد كود العمارة للتفعيل (مثال: *تفعيل حدائق BLD-1025*)' };
+  }
+
+  const normalizedDigits = normalizeDigits(buildingCode).toUpperCase();
+  const codeMatch = normalizedDigits.match(/BLD-?[0-9]{4}/) || normalizedDigits.match(/[0-9]{4}/);
+  if (!codeMatch) {
+    return { ok: false, message: 'كود العمارة غير صالح. الصيغة الصحيحة: BLD-xxxx' };
+  }
+
+  const targetCode = codeMatch[0].startsWith('BLD')
+    ? (codeMatch[0].includes('-') ? codeMatch[0] : 'BLD-' + codeMatch[0].slice(3))
+    : 'BLD-' + codeMatch[0];
+
+  // جلب العمارة من قاعدة البيانات
+  const { data: bldList, error: bldErr } = await supabase
+    .from('buildings')
+    .select('*')
+    .eq('code', targetCode);
+
+  if (bldErr || !bldList || bldList.length === 0) {
+    return { ok: false, message: `لم يتم العثور على عمارة مسجلة بالكود: (*${targetCode}*)` };
+  }
+
+  const building = bldList[0];
+
+  // فحص هل العمارة استفادت مسبقاً من مبادرة حدائق العاصمة
+  const { data: initRow } = await supabase
+    .from('building_settings')
+    .select('value')
+    .eq('building_id', building.id)
+    .eq('key', 'capital_gardens_initiative')
+    .maybeSingle();
+
+  if (initRow && initRow.value) {
+    let initData = {};
+    try { initData = JSON.parse(initRow.value); } catch (_) {}
+    if (initData.status === 'active') {
+      return {
+        ok: false,
+        alreadyClaimed: true,
+        message: `عمارة (*${building.name}* - كود: *${building.code}*) قد استفادت بالفعل مسبقاً من مبادرة حدائق العاصمة وتفعيلها السنوي نشط حتى: ${initData.expiry_date || 'تاريخ انتهاء الاشتراك'}.`
+      };
+    }
+  }
+
+  // حساب تاريخ الانتهاء الجديد (سنة كاملة = 365 يوماً من الآن أو من تاريخ انتهاء الاشتراك الحالي إن كان سارياً)
+  const { data: latestSubs } = await supabase
+    .from('building_subscriptions')
+    .select('*')
+    .eq('building_id', building.id)
+    .order('expiry_date', { ascending: false })
+    .limit(1);
+
+  const startDate = new Date();
+  const currentExpiry = latestSubs && latestSubs[0] && latestSubs[0].expiry_date ? new Date(latestSubs[0].expiry_date) : null;
+  const baseDate = (currentExpiry && currentExpiry > new Date()) ? currentExpiry : new Date();
+
+  const newExpiry = new Date(baseDate);
+  newExpiry.setFullYear(newExpiry.getFullYear() + 1);
+
+  // 1. تسجيل الاشتراك المجاني في Supabase
+  const { data: subData, error: subErr } = await supabase
+    .from('building_subscriptions')
+    .insert([{
+      building_id: building.id,
+      years_count: 1,
+      price_paid: 0,
+      payment_method: 'مبادرة حدائق العاصمة #هنطور_مدينتنا',
+      start_date: startDate.toISOString(),
+      expiry_date: newExpiry.toISOString(),
+      is_active: true,
+      is_trial: false,
+      notes: 'تفعيل سنوي مجاني 100% ضمن مبادرة أهالي وجيران حدائق العاصمة #هنطور_مدينتنا'
+    }])
+    .select();
+
+  if (subErr) {
+    return { ok: false, message: `خطأ أثناء تسجيل اشتراك المبادرة: ${subErr.message}` };
+  }
+
+  // 2. تحديث حالة العمارة إلى نشطة
+  await supabase.from('buildings').update({ is_active: true }).eq('id', building.id);
+
+  // 3. تسجيل بيانات المبادرة في إعدادات العمارة لمنع تكرارها
+  await supabase
+    .from('building_settings')
+    .upsert({
+      building_id: building.id,
+      key: 'capital_gardens_initiative',
+      value: JSON.stringify({
+        status: 'active',
+        building_id: building.id,
+        building_code: building.code,
+        building_name: building.name,
+        activated_at: new Date().toISOString(),
+        expiry_date: newExpiry.toISOString(),
+        activated_by: 'initiative_capital_gardens',
+        client_phone: clientPhone || building.manager_phone
+      }),
+      updated_at: new Date().toISOString()
+    });
+
+  const formattedNewExpiry = formatDate(newExpiry);
+
+  // 4. صياغة الرسالة الاحتفالية بالعميل وأهل مدينتنا ومبادرة #هنطور_مدينتنا
+  const celebrationMsg =
+    `🎉🏢 *ألف مبروك لجيراننا الكرام في مدينتنا «حدائق العاصمة»!* ✨\n\n` +
+    `أهلاً بحضرتك يا فندم، تم بنجاح وبكل فخر تفعيل وترخيص نظام عمارتكم (*${building.name}* - كود: *${building.code}*) **مجاناً بالكامل لمدة سنة كاملة (365 يوماً)** هدية من ابن مدينتكم ومطور التطبيق ضمن مبادرة:\n` +
+    `🌟 *#هنطور_مدينتنا* 🌟\n\n` +
+    `✅ *تفاصيل الترخيص المفعل:*\n` +
+    `• مدة الاشتراك: *سنة كاملة مجاناً (100% هدية لأهل حدائق العاصمة)*\n` +
+    `• تاريخ الصلاحية حتى: *${formattedNewExpiry}*\n` +
+    `• الميزة: متاح لجميع شقق وسكان العمارة ومجلس الإدارة بالكامل بلا أي قيود 🚀\n\n` +
+    `🤝 *كلمة من القلب من ابن مدينتكم:*\n` +
+    `فكرة تطبيق "عمارتي" بدأت بهدف الارتقاء بإدارة عماراتنا ومجتمعنا الراقي في حدائق العاصمة وتوفير الشفافية والراحة لكل جار. ويسعدنا ويشرفنا جداً أن تكون عمارتكم جزءاً من هذا التطور والتحول الرقمي لمدينتنا الجميلة.\n\n` +
+    `⭐ كل ما نرجوه من ذوق حضرتك كدعم لمشروعنا المحلي هو التكرم بترك تقييم 5 نجوم وكلمة طيبة على متجر Google Play لمساعدتنا على الاستمرار وتطوير ميزات جديدة لخدمتكم دائماً:\n` +
+    `🔗 https://play.google.com/store/apps/details?id=com.ammarty.ammarty\n\n` +
+    `معاً نرتقي بمدينتنا.. ودمتم ودامت حدائق العاصمة في أجمل صورة دائماً! 🌸\n` +
+    `#هنطور_مدينتنا #حدائق_العاصمة`;
+
+  // 5. إرسال الرسالة إلى العميل المتواصل و/أو مدير العمارة
+  let notified = false;
+  if (sock) {
+    const targets = new Set();
+    if (clientJid) targets.add(clientJid);
+    if (building.manager_phone) {
+      const cleanPhone = building.manager_phone.replace(/\D/g, '');
+      const mgrJid = (cleanPhone.startsWith('20') ? cleanPhone : ('2' + (cleanPhone.startsWith('0') ? cleanPhone.slice(1) : cleanPhone))) + '@s.whatsapp.net';
+      targets.add(mgrJid);
+    }
+    for (const target of targets) {
+      try {
+        await sock.sendMessage(target, { text: celebrationMsg });
+        notified = true;
+      } catch (_) {}
+    }
+  }
+
+  return {
+    ok: true,
+    building,
+    expiryDate: newExpiry,
+    formattedExpiry: formattedNewExpiry,
+    notified,
+    celebrationMsg
+  };
+}
+
+/**
  * 5. إرسال رسالة رسمية لمدير عمارة محددة
  */
 async function sendMessageToBuildingManager({ supabase, sock, buildingCode, messageText }) {
@@ -691,6 +852,12 @@ function getAdminCommandsMenu() {
     `_(مثال: رسالة BLD-1025 نرجو التكرم بمراجعة اشتراكات الشقق)_\n\n` +
     `🖥️ *سيرفر* أو *حالة*\n` +
     `فحص زمن تشغيل السيرفر، استهلاك الذاكرة، وسرعة استجابة قاعدة البيانات.\n\n` +
+    `⏸️ *محادثات موقوفة* أو *الموقوفين*\n` +
+    `عرض قائمة المحادثات التي يتحدث معها الأدمن حالياً والبوت متوقف عن الرد الآلي فيها.\n\n` +
+    `▶️ *تشغيل [رقم هاتف]*\n` +
+    `إعادة تفعيل الرد التلقائي للبوت فوراً مع عميل محدد.\n\n` +
+    `⏸️ *ايقاف [رقم هاتف]*\n` +
+    `إيقاف ردود البوت التلقائية مع عميل محدد لمدة 24 ساعة.\n\n` +
     `⏳ *تجارب* أو *قريب الانتهاء*\n` +
     `كشف بأقرب 10 عمائر توشك فترتها التجريبية على الانتهاء.\n\n` +
     `🧪 *اختبار التجارب*\n` +
@@ -833,6 +1000,52 @@ async function handleAdminMessage({
     return;
   }
 
+  // ---------- و.1) كشف المحادثات قيد المتابعة البشرية (وضع الصمت) ----------
+  if (/^(?:محادثات موقوفة|المحادثات الموقوفة|الموقوفين|الموقوفة|وضع بشري|قائمة التوقف|صمت)$/i.test(trimmed)) {
+    const list = getAllActiveTakeovers();
+    if (list.length === 0) {
+      await sock.sendMessage(senderJid, {
+        text: `✅ لا توجد أي محادثات موقوفة حالياً يا باشمهندس محمود. البوت يعمل بكامل طاقته ويرد على جميع العملاء تلقائياً! ⚡`
+      });
+      return;
+    }
+
+    let report = `⏸️ *كشف المحادثات قيد المتابعة البشرية (${list.length}):* 👨‍💼✨\n\n`;
+    list.forEach((item, idx) => {
+      report +=
+        `*${idx + 1}️⃣ العميل:* ${item.cleanTarget}\n` +
+        `• *السبب:* ${item.reason}\n` +
+        `• *المتبقي لصمت البوت:* ${item.remainingMinutes} دقيقة\n` +
+        `• *لإعادة تشغيل البوت له فوراً:* اكتب *تشغيل ${item.cleanTarget}*\n` +
+        `------------------------------------\n`;
+    });
+    report += `💡 *ملاحظة:* بمجرد إرسالك لأي رسالة لأي عميل من هاتفك يتم إيقاف البوت معه تلقائياً لساعتين لعدم مقاطعتك.`;
+    await sock.sendMessage(senderJid, { text: report });
+    return;
+  }
+
+  // ---------- و.1.2) إلغاء إيقاف البوت لرقم معين يدوياً ----------
+  const resumeMatch = trimmed.match(/^(?:تشغيل|تفعيل|استئناف)\s+(01[0125][0-9]{8})$/i);
+  if (resumeMatch) {
+    const phone = resumeMatch[1];
+    clearHumanMode(null, phone);
+    await sock.sendMessage(senderJid, {
+      text: `✅ تم إلغاء الإيقاف وإعادة تفعيل الرد التلقائي للبوت فوراً مع الرقم (${phone}) يا باشمهندس محمود! 🚀`
+    });
+    return;
+  }
+
+  // ---------- و.1.3) إيقاف البوت لرقم معين يدوياً لمدة 24 ساعة ----------
+  const pauseMatch = trimmed.match(/^(?:ايقاف|إيقاف|وقف|توقف)\s+(01[0125][0-9]{8})$/i);
+  if (pauseMatch) {
+    const phone = pauseMatch[1];
+    setHumanMode(null, phone, EXTENDED_TAKEOVER_MS, 'إيقاف يدوي من لوحة تحكم الأدمن 24 ساعة');
+    await sock.sendMessage(senderJid, {
+      text: `⏸️ تم إيقاف ردود البوت التلقائية مع الرقم (${phone}) لمدة 24 ساعة يا باشمهندس محمود! 🔇`
+    });
+    return;
+  }
+
   // ---------- و.2) كشف الاشتراكات التجريبية التي تقترب من الانتهاء ----------
   if (/^(?:تجارب|التجارب|قريب الانتهاء|قريب|انتهاء التجارب)$/i.test(trimmed)) {
     const { getExpiringTrialBuildings } = require('./trial_reminder_service');
@@ -898,7 +1111,34 @@ async function handleAdminMessage({
     return;
   }
 
-  // ---------- ز) التفعيل الإداري الفوري لعمارة ----------
+  // ---------- ز.1) تفعيل مبادرة حدائق العاصمة المجانية (#هنطور_مدينتنا) ----------
+  const capitalMatch = normalized.match(/^(?:تفعيل\s+حدائق|مبادرة\s+حدائق|حدائق)\s+(?:عمارة\s+)?(BLD-?[0-9]{4}|[0-9]{4})$/i);
+  if (capitalMatch) {
+    const code = capitalMatch[1];
+    await sock.sendMessage(senderJid, { text: `⏳ جاري تفعيل اشتراك مبادرة حدائق العاصمة مجاناً لسنة كاملة لعمارة (${code})...` });
+    const result = await activateCapitalGardensBuilding({
+      supabase,
+      sock,
+      buildingCode: code
+    });
+
+    if (!result.ok) {
+      await sock.sendMessage(senderJid, { text: `❌ ${result.message}` });
+      return;
+    }
+
+    await sock.sendMessage(senderJid, {
+      text: `✅ *تم تفعيل مبادرة حدائق العاصمة بنجاح يا باشمهندس محمود!* 🏢✨\n\n` +
+            `• *العمارة:* ${result.building.name} (كود: *${result.building.code}*)\n` +
+            `• *المدير:* ${result.building.manager_name || 'غير مسجل'} (${result.building.manager_phone || 'بدون هاتف'})\n` +
+            `• *المدة:* سنة كاملة مجاناً (100% هدية لأهل حدائق العاصمة)\n` +
+            `• *تاريخ الصلاحية الجديد:* حتى *${result.formattedExpiry}*\n` +
+            `• *إشعار المدير والعميل:* تم إرسال رسالة التهنئة الخاصة بالمبادرة (#هنطور_مدينتنا) ورابط التقييم بنجاح! 🚀`
+    });
+    return;
+  }
+
+  // ---------- ز.2) التفعيل الإداري الفوري لعمارة ----------
   const activationMatch = normalized.match(/^(?:تفعيل|تجديد)\s+(?:عمارة\s+)?(BLD-?[0-9]{4}|[0-9]{4})(?:\s+(.*))?$/i);
   if (activationMatch) {
     const code = activationMatch[1];
@@ -1011,6 +1251,7 @@ module.exports = {
   getPendingOrdersReport,
   searchBuildingsReport,
   adminActivateBuilding,
+  activateCapitalGardensBuilding,
   sendMessageToBuildingManager,
   getServerHealth,
   getAdminCommandsMenu,
