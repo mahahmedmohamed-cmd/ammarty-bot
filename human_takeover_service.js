@@ -12,14 +12,20 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 // ملف حفظ الحالات المؤقتة لضمان استمرارها حتى لو أعيد تشغيل السيرفر
 const STORAGE_FILE = path.join(__dirname, 'human_takeovers.json');
 
 // الفترات الزمنية الافتراضية
-const DEFAULT_TAKEOVER_MS = 2 * 60 * 60 * 1000; // ساعتان عند إرسال الأدمن أي رسالة
+const DEFAULT_TAKEOVER_MS = 30 * 60 * 1000; // 30 دقيقة عند إرسال الأدمن أي رسالة
 const EXTENDED_TAKEOVER_MS = 24 * 60 * 60 * 1000; // 24 ساعة عند طلب الإيقاف اليدوي
 const CUSTOMER_REQUEST_MS = 4 * 60 * 60 * 1000; // 4 ساعات عند طلب العميل التحدث مع شخص بشري
+
+// إعداد سوبابايز لمزامنة الحالات السحابية عبر سيرفر Render
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://iowpdqulkujikzsjgebd.supabase.co';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlvd3BkcXVsa3VqaWt6c2pnZWJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1OTQ1NDYsImV4cCI6MjEwNDE3MDU0Nn0.26U1YKl_XFvTBu3r4jJJs5VrZr1vzr9DGrpgFsMTLEU';
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // مجموعة لتتبع كافة معرفات الرسائل التي أرسلها كود البوت
 const botSentMessageIds = new Set();
@@ -28,7 +34,7 @@ const botSentMessageIds = new Set();
 const humanTakeovers = new Map();
 
 /**
- * تحميل الحالات المحفوظة من القرص
+ * تحميل الحالات المحفوظة من القرص ومن سوبابايز
  */
 function loadTakeoversFromDisk() {
   try {
@@ -46,8 +52,36 @@ function loadTakeoversFromDisk() {
   }
 }
 
+// مزامنة سحابية غير متزامنة من سوبابايز عند بدء التشغيل
+async function syncTakeoversFromSupabase() {
+  try {
+    const { data, error } = await supabase
+      .from('building_settings')
+      .select('value')
+      .eq('building_id', 83)
+      .eq('key', 'active_human_takeovers')
+      .maybeSingle();
+
+    if (!error && data && data.value) {
+      const remote = JSON.parse(data.value);
+      const now = Date.now();
+      let changed = false;
+      for (const [key, val] of Object.entries(remote)) {
+        if (val && val.expiresAt && val.expiresAt > now) {
+          if (!humanTakeovers.has(key) || humanTakeovers.get(key).expiresAt < val.expiresAt) {
+            humanTakeovers.set(key, val);
+            changed = true;
+          }
+        }
+      }
+      if (changed) saveTakeoversToDisk();
+    }
+  } catch (_) {}
+}
+
+let supabaseSaveTimer = null;
 /**
- * حفظ الحالات النشطة في القرص
+ * حفظ الحالات النشطة في القرص وسوبابايز
  */
 function saveTakeoversToDisk() {
   try {
@@ -59,6 +93,19 @@ function saveTakeoversToDisk() {
       }
     }
     fs.writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2), 'utf8');
+
+    // حفظ سحابي في سوبابايز لضمان استمرار الحالات حتى عند إعادة تشغيل سيرفر Render
+    if (supabaseSaveTimer) clearTimeout(supabaseSaveTimer);
+    supabaseSaveTimer = setTimeout(async () => {
+      try {
+        await supabase.from('building_settings').upsert({
+          building_id: 83,
+          key: 'active_human_takeovers',
+          value: JSON.stringify(data),
+          updated_at: new Date().toISOString()
+        });
+      } catch (_) {}
+    }, 1000);
   } catch (err) {
     console.error('[HumanTakeover] خطأ أثناء حفظ الملف:', err.message);
   }
@@ -66,6 +113,7 @@ function saveTakeoversToDisk() {
 
 // تحميل الحالات عند بدء التشغيل
 loadTakeoversFromDisk();
+syncTakeoversFromSupabase();
 
 /**
  * تنظيف المعرف أو رقم الهاتف للمقارنة الموحدة
@@ -286,10 +334,10 @@ async function handleAdminOutgoingMessage({ targetJid, text, msg, sock, logEvent
   }
 
   // 4. رسالة عادية أرسلها الأدمن للعميل (نص، صورة، فويس، مستند...)
-  // نفعل وضع التحدث البشري ونوقف البوت لمدة ساعتين لمنع أي تداخل
-  setHumanMode(targetJid, cleanPhone, DEFAULT_TAKEOVER_MS, 'محادثة بشرية جارية من المطور');
+  // نفعل وضع التحدث البشري ونوقف البوت لمدة 30 دقيقة لمنع أي تداخل
+  setHumanMode(targetJid, cleanPhone, DEFAULT_TAKEOVER_MS, 'محادثة بشرية جارية من المطور (30 دقيقة)');
   if (logEvent) {
-    logEvent('تدخل بشري مكتشف', `المهندس محمود يراسل ${cleanPhone || targetJid} - تم إيقاف البوت تلقائياً لساعتين`, 'info');
+    logEvent('تدخل بشري مكتشف', `المهندس محمود يراسل ${cleanPhone || targetJid} - تم إيقاف البوت تلقائياً لمدة 30 دقيقة`, 'info');
   }
 
   return { action: 'takeover_activated', targetJid };

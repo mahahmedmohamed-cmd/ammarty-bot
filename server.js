@@ -417,6 +417,42 @@ async function initWhatsApp() {
 
         logEvent('رسالة واتساب واردة', { from: senderPhone, text: text.slice(0, 80) });
 
+        // ==================== 0.5 فحص وضع التحدث البشري (Human Takeover) ====================
+        // إذا قام المهندس محمود بالرد على هذا العميل خلال آخر 30 دقيقة -> نصمت تماماً ولا نقاطع المحادثة نهائياً
+        if (isHumanModeActive(senderJid, senderPhone)) {
+          logEvent('محادثة بشرية جارية', {
+            from: senderPhone,
+            jid: senderJid,
+            reason: 'تم حجب الرد التلقائي لإفساح المجال للمهندس محمود للمتابعة مع العميل بحرية (صامت لمدة 30 دقيقة)'
+          }, 'info');
+          continue;
+        }
+
+        // فحص هل العميل يطلب صراحة التحدث مع شخص بشري/خدمة العملاء
+        if (isRequestingHumanAgent(text)) {
+          setHumanMode(senderJid, senderPhone, CUSTOMER_REQUEST_MS, 'طلب العميل التحدث مع شخص بشري');
+          logEvent('طلب تدخل بشري من العميل', { from: senderPhone, text: text.slice(0, 80) }, 'warning');
+
+          const humanReply =
+            `أهلاً بحضرتك يا فندم 👨‍💼✨\n\n` +
+            `تم تحويل محادثتك فوراً لمسؤول خدمة العملاء والدعم الفني لمتابعة طلبك والتواصل معك مباشرة.\n\n` +
+            `سيتم الرد على استفسارك في أقرب وقت بمجرد فتح الشات 🌸`;
+
+          await sock.sendMessage(senderJid, { text: humanReply });
+
+          try {
+            const adminAlertJid = '201021252626@s.whatsapp.net';
+            const adminNotify =
+              `🔔 *طلب دعم بشري من عميل*\n\n` +
+              `• *رقم هاتف العميل:* ${senderPhone}\n` +
+              `• *نص الرسالة:* "${text}"\n\n` +
+              `💡 *ملاحظة:* تم إيقاف ردود البوت التلقائية مع هذا الشات مؤقتاً لتتمكن من التحدث معه بحرية تامة دون أي مقاطعة.`;
+            await sock.sendMessage(adminAlertJid, { text: adminNotify });
+          } catch (_) {}
+
+          continue;
+        }
+
         // ---------- 1. فحص طلب تفعيل/تجديد الاشتراك من التطبيق ----------
         const renewal = parseRenewalWhatsAppMessage(text);
         if (renewal) {
@@ -986,13 +1022,6 @@ async function initWhatsApp() {
               continue;
             }
 
-            // إذا لم تكن سكرين شوت تقييم ولا إثبات مبادرة، فهي إيصال تحويل مالي
-            if (isImage) {
-              await sock.sendMessage(senderJid, {
-                text: `⏳ تم استلام صورة الإيصال بنجاح وجاري التأكد من معلومات الدفع بالحساب`
-              });
-            }
-
             const receiptData = parseReceiptData(ocrText, text);
             logEvent('بيانات الإيصال المحللة', {
               amount: receiptData.amount,
@@ -1000,6 +1029,19 @@ async function initWhatsApp() {
               recipientOk: receiptData.isAuthorizedRecipient,
               method: receiptData.paymentMethod
             });
+
+            // التأكد أولاً هل الصورة أو الرسالة تحتوي على مؤشرات إيصال مالي فعلي قبل إرسال رسالة التأكيد
+            const looksLikeFinancialReceipt = isProofText || hasPaymentMarkers || !!receiptData.amount || !!receiptData.reference || !!receiptData.buildingCode;
+
+            if (!looksLikeFinancialReceipt && isImage) {
+              logEvent('صورة واردة ليست إيصال سداد مالي', { senderPhone, text: text.slice(0, 60) }, 'info');
+              // لا نرسل رسالة "تم استلام الإيصال" ولا نفعل اشتراكات خاطئة، بل ندعها تمر للدعم الفني
+            } else {
+              if (isImage) {
+                await sock.sendMessage(senderJid, {
+                  text: `⏳ تم استلام صورة الإيصال بنجاح وجاري التأكد من معلومات الدفع بالحساب`
+                });
+              }
 
             // جلب طلبات التجديد المعلقة من سوبابايز
             const { data: pendingRows } = await supabase
@@ -1306,10 +1348,11 @@ async function initWhatsApp() {
               });
               continue;
             }
-          } catch (err) {
-            logEvent('خطأ أثناء معالجة الإيصال بالذكاء الاصطناعي', err.message, 'error');
-          }
+          } // نهاية شرط looksLikeFinancialReceipt
+        } catch (err) {
+          logEvent('خطأ أثناء معالجة الإيصال بالذكاء الاصطناعي', err.message, 'error');
         }
+      }
 
         // ---------- 3. كود استعادة كلمة المرور المكون من 5 أرقام ----------
         const codeMatch = text.match(/\b\d{5}\b/);
@@ -1349,40 +1392,6 @@ async function initWhatsApp() {
           } catch (err) {
             logEvent('خطأ كود كلمة المرور', err.message, 'error');
           }
-          continue;
-        }
-
-        // ==================== 3.4 فحص وضع التحدث البشري (Human Takeover) ====================
-        if (isHumanModeActive(senderJid, senderPhone)) {
-          logEvent('محادثة بشرية جارية', {
-            from: senderPhone,
-            reason: 'تم حجب الرد التلقائي لإفساح المجال للمهندس محمود للمتابعة مع العميل بحرية'
-          }, 'info');
-          continue;
-        }
-
-        // فحص هل العميل يطلب صراحة التحدث مع شخص بشري/خدمة العملاء
-        if (isRequestingHumanAgent(text)) {
-          setHumanMode(senderJid, senderPhone, CUSTOMER_REQUEST_MS, 'طلب العميل التحدث مع شخص بشري');
-          logEvent('طلب تدخل بشري من العميل', { from: senderPhone, text: text.slice(0, 80) }, 'warning');
-
-          const humanReply =
-            `أهلاً بحضرتك يا فندم 👨‍💼✨\n\n` +
-            `تم تحويل محادثتك فوراً لمسؤول خدمة العملاء والدعم الفني لمتابعة طلبك والتواصل معك مباشرة.\n\n` +
-            `سيتم الرد على استفسارك في أقرب وقت بمجرد فتح الشات 🌸`;
-
-          await sock.sendMessage(senderJid, { text: humanReply });
-
-          try {
-            const adminAlertJid = '201021252626@s.whatsapp.net';
-            const adminNotify =
-              `🔔 *طلب دعم بشري من عميل*\n\n` +
-              `• *رقم هاتف العميل:* ${senderPhone}\n` +
-              `• *نص الرسالة:* "${text}"\n\n` +
-              `💡 *ملاحظة:* تم إيقاف ردود البوت التلقائية مع هذا الشات لمدة 4 ساعات لتتمكن من التحدث معه بحرية تامة دون أي مقاطعة.`;
-            await sock.sendMessage(adminAlertJid, { text: adminNotify });
-          } catch (_) {}
-
           continue;
         }
 
@@ -1632,6 +1641,12 @@ setTimeout(pollOutbox, 8000);
 
 function parseEgyptianPaymentSMS(text, defaultSender = 'Vodafone Cash') {
   if (!text) return null;
+
+  // تجاهل رسائل الاستعلام عن الرصيد البنكي أو رصيد المحفظة (ليست تحويلات مالية واردة)
+  if (/(?:balance is|رصيدك الحالي|الرصيد المتاح|استعلام عن الرصيد|Your current Vodafone Cash balance)/i.test(text)) {
+    return null;
+  }
+
   let cleaned = text.replace(/[\u0660-\u0669]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d));
 
   let amount = null;

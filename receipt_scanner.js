@@ -94,10 +94,14 @@ function parseReceiptData(ocrText = '', userText = '') {
       break;
     }
   }
-  // فحص الاسم
+  // فحص الاسم (مع استبعاد عناوين البريد الإلكتروني لتجنب المطابقة الخاطئة إذا كان إيميل العميل يحتوي على اسم الأدمن)
   if (!isAuthorizedRecipient) {
+    const textWithoutEmails = normalizedLower
+      .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '')
+      .replace(/[a-zA-Z0-9._%+-]+@yaho\w*/g, '');
+
     for (const n of AUTHORIZED_RECEIVERS.names) {
-      if (normalizedLower.includes(n.toLowerCase())) {
+      if (textWithoutEmails.includes(n.toLowerCase())) {
         isAuthorizedRecipient = true;
         break;
       }
