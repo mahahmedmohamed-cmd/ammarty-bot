@@ -1457,8 +1457,9 @@ async function initWhatsApp() {
 
 initWhatsApp();
 
-// ==================== الجدولة التلقائية لتنبيهات الاشتراكات التجريبية ====================
-// فحص دوري كل ساعتين، وإرسال التنبيهات تلقائياً في الفترة الصباحية (بين 11:00 ص و 13:00 م بتوقيت مصر)
+// ==================== الجدولة التلقائية لتنبيهات الاشتراكات التجريبية (معطلة) ====================
+// تم إيقاف التنبيهات التلقائية لعملاء الفترات التجريبية نهائياً بناءً على رغبة الإدارة
+/*
 setInterval(async () => {
   try {
     if (!sock || !isConnected) return;
@@ -1472,6 +1473,7 @@ setInterval(async () => {
     logEvent('خطأ الجدولة التلقائية للتجارب', cronErr.message, 'warning');
   }
 }, 2 * 60 * 60 * 1000);
+*/
 
 // ==================== مراقب صندوق الإرسال الآلي (Outbox Poller) ====================
 // محرك متزامن محكم يمنع التكرار نهائياً (Sequential Loop + In-Memory Lock + Immediate DB Lock)
@@ -2236,26 +2238,13 @@ app.post('/api/trial-reminders/test', async (req, res) => {
   }
 });
 
-// نقطة إرسال التنبيهات الفعلية لأقرب N عمائر
+// نقطة إرسال التنبيهات الفعلية لأقرب N عمائر (تم إيقافها)
 app.post('/api/trial-reminders/send-live', async (req, res) => {
-  try {
-    if (!sock || !isConnected) {
-      return res.status(400).json({ ok: false, error: 'واتساب غير متصل حالياً' });
-    }
-    const limit = parseInt(req.body?.limit || req.query?.limit || '10', 10);
-    const targetBuildingIds = req.body?.buildingIds || req.body?.targetBuildingIds || null;
-    const result = await checkAndSendTrialReminders({
-      supabase,
-      sock,
-      logEvent,
-      isManualTrigger: true,
-      limit,
-      targetBuildingIds
-    });
-    res.json({ ok: true, message: `تم إرسال التنبيهات لـ ${result.sentCount} عمارة بنجاح`, result });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  return res.json({
+    ok: false,
+    message: 'تم إيقاف إرسال رسائل التذكير لعملاء الفترات التجريبية نهائياً بناءً على طلب الإدارة',
+    sentCount: 0
+  });
 });
 
 // نقطة إرسال باقات الاشتراك وعرض الهدية فورياً لعمارة معينة (مثل عمارة حسني أو عمارة طلباتي)
@@ -2465,12 +2454,12 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="section-box">
-          <strong style="color:#38bdf8; display:block; margin-bottom:6px;"><i class="fa-solid fa-bullhorn"></i> حملة متابعة الاشتراكات التجريبية (أقرب 10 عمائر):</strong>
-          <span style="display:block; margin-bottom:10px;">إرسال استفسار التجديد المهذب بنظام الخيارين (1: نعم، وضح لي / 2: لا، شكراً):</span>
+          <strong style="color:#ef4444; display:block; margin-bottom:6px;"><i class="fa-solid fa-bullhorn"></i> حملة متابعة الاشتراكات التجريبية (متوقفة ومحظورة):</strong>
+          <span style="display:block; margin-bottom:10px; color:#94a3b8;">تم إيقاف إرسال رسائل التذكير التلقائية لعملاء الفترات التجريبية نهائياً بناءً على طلب الإدارة:</span>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <button onclick="runTrialTest()" class="btn btn-purple" style="font-size:13px; padding:8px 14px;"><i class="fa-solid fa-flask"></i> 🧪 تجربة إرسال لهاتفي (01021252626)</button>
-            <button onclick="runTrialLive(10)" class="btn btn-warning" style="font-size:13px; padding:8px 14px;"><i class="fa-solid fa-paper-plane"></i> 🚀 إرسال لأقرب 10 عمائر</button>
-            <a href="/api/trial-reminders?limit=10" target="_blank" class="btn" style="font-size:13px; padding:8px 14px; background:#475569;"><i class="fa-solid fa-eye"></i> كشف الـ 10 عمائر (JSON)</a>
+            <button disabled class="btn" style="font-size:13px; padding:8px 14px; background:#475569; opacity:0.6; cursor:not-allowed;"><i class="fa-solid fa-ban"></i> 🛑 إرسال للعملاء (معطل نهائياً)</button>
+            <a href="/api/trial-reminders?limit=10" target="_blank" class="btn" style="font-size:13px; padding:8px 14px; background:#334155;"><i class="fa-solid fa-eye"></i> كشف الـ 10 عمائر (JSON)</a>
           </div>
         </div>
 

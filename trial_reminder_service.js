@@ -193,6 +193,12 @@ async function checkAndSendTrialReminders({
     return { ok: false, sentCount: 0, reason: 'whatsapp_not_connected' };
   }
 
+  // 🛑 حظر تام لإرسال أي رسائل تذكير لعملاء الفترات التجريبية نهائياً بناءً على طلب الإدارة
+  if (!targetPhoneOverride) {
+    logEvent('تنبيهات التجارب معطلة نهائياً', 'تم حظر وإيقاف إرسال أي رسائل تذكير لعملاء الفترات التجريبية نهائياً بناءً على طلب الإدارة.', 'info');
+    return { ok: false, sentCount: 0, reason: 'trial_reminders_disabled' };
+  }
+
   logEvent('بدء فحص الاشتراكات التجريبية', `جاري البحث عن أقرب (${limit}) عمائر تقترب من انتهاء التجربة...`, 'info');
 
   const expiringList = await getExpiringTrialBuildings(supabase, {

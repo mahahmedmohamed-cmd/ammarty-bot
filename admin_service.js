@@ -1067,9 +1067,8 @@ async function handleAdminMessage({
         `------------------------------------\n`;
     });
     report +=
-      `💡 *خيارات الإرسال المتاحة:*\n` +
-      `• لتجربة الرسالة على هاتفك الخاص أولاً: اكتب *اختبار التجارب*\n` +
-      `• لإرسال الرسائل للمديرين الفعليين (10 عمائر): اكتب *ارسال التجارب 10*`;
+      `💡 *ملاحظة:* تم إيقاف وتجميد إرسال رسائل التذكير التلقائية لعملاء الفترات التجريبية نهائياً بناءً على طلبكم.\n` +
+      `• لتجربة الرسالة على هاتفك الخاص فقط: اكتب *اختبار التجارب*`;
     await sock.sendMessage(senderJid, { text: report });
     return;
   }
@@ -1092,21 +1091,11 @@ async function handleAdminMessage({
     return;
   }
 
-  // ---------- و.3) إطلاق حملة تنبيه التجارب الفعلي للمديرين ----------
+  // ---------- و.3) إطلاق حملة تنبيه التجارب الفعلي للمديرين (معطلة نهائياً) ----------
   const sendTrialsMatch = trimmed.match(/^(?:ارسال التجارب|إرسال التجارب|تنبيه التجارب|بدء التجارب)(?:\s+(\d+))?$/i);
   if (sendTrialsMatch) {
-    const count = sendTrialsMatch[1] ? parseInt(sendTrialsMatch[1], 10) : 10;
-    const { checkAndSendTrialReminders } = require('./trial_reminder_service');
-    await sock.sendMessage(senderJid, { text: `⏳ جاري فحص أقرب (${count}) عمائر وإرسال رسائل استفسار التجديد للمديرين بفاصل زمني آمن لحماية الرقم...` });
-    const res = await checkAndSendTrialReminders({
-      supabase,
-      sock,
-      logEvent,
-      isManualTrigger: true,
-      limit: count
-    });
     await sock.sendMessage(senderJid, {
-      text: `✅ اكتملت العملية بنجاح يا باشمهندس محمود! تم إرسال رسائل الاستفسار لـ (${res.sentCount || 0}) عمارة.`
+      text: `🛑 تم إيقاف وحظر إرسال رسائل التذكير لعملاء الفترات التجريبية نهائياً بناءً على توجيهاتكم يا باشمهندس محمود، ولن يقوم البوت بإرسال أي رسائل تذكير للمديرين.`
     });
     return;
   }
